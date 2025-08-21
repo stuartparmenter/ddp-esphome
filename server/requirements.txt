@@ -1,0 +1,11 @@
+av>=15,<16
+imageio>=2.35,<3
+imageio-ffmpeg>=0.6,<1
+numpy>=2,<3
+pillow>=10,<13
+psutil>=5,<8
+PyYAML>=6,<7
+websockets>=12,<16
+
+# Optional perf (POSIX only)
+uvloop>=0.19 ; platform_system!="Windows"

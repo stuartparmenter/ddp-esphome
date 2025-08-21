@@ -1,0 +1,128 @@
+# ----------------------------
+# OS / Editor junk
+# ----------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+._*
+*.swp
+*.swo
+*.orig
+
+# VS Code / JetBrains
+.vscode/
+.idea/
+*.code-workspace
+
+# ----------------------------
+# Python (server, tooling)
+# ----------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+.build/
+dist/
+build/
+.venv/
+.venv*/
+env/
+env*/
+.pytest_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+pip-wheel-metadata/
+*.ipynb_checkpoints
+
+# ----------------------------
+# Node (only if you add docs UI)
+# ----------------------------
+node_modules/
+npm-debug.log*
+yarn-error.log*
+.pnpm-store/
+
+# ----------------------------
+# ESPHome / PlatformIO / ESP-IDF
+# ----------------------------
+# ESPHome working dir + build cache
+.esphome/
+!.esphome/secrets.example.yaml      # keep a template only
+# If you keep schemas or helper scripts under .esphome, un-ignore them above.
+
+# PlatformIO build output
+.pio/
+.pioenvs/
+.piolibdeps/
+.clang_complete
+.gcc-flags.json
+
+# IDF / toolchain artifacts
+sdkconfig
+sdkconfig.old
+*.map
+*.elf
+*.bin
+*.hex
+*.a
+*.o
+*.obj
+*.d
+*.lst
+*.dump
+*.gcno
+*.gcda
+
+# ----------------------------
+# C/C++ compile caches
+# ----------------------------
+.ccls-cache/
+.clangd/
+
+# ----------------------------
+# Logs & runtime artifacts
+# ----------------------------
+*.log
+logs/
+*.tmp
+tmp/
+*.pid
+
+# ----------------------------
+# Media & large sample assets
+# ----------------------------
+# Keep examples lightweight; users can add their own media locally.
+media/
+*.gif
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.jpg
+*.jpeg
+*.png
+*.bmp
+
+# ----------------------------
+# Secrets / local config
+# ----------------------------
+secrets.yaml
+*.local.yaml
+*.env
+.env.*
+.envrc
+ws_ddp_proxy.local.yaml
+
+# ----------------------------
+# Docs builds (if you add Sphinx/MkDocs)
+# ----------------------------
+site/
+public/
+_build/
+docs/_build/
