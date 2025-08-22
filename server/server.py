@@ -3,7 +3,7 @@
 #!/usr/bin/env python3
 """
 server.py
-- WebSocket control at /control?w=..&h=..&out=..&src=..[&pace=N][&ema=A][&expand=(0|1|2)][&loop=1][&hw=auto]
+- WebSocket control at /control (JSON messages: hello, start_stream, update, stop_stream, ping)
 - Sends full RGB888 frames via DDP (UDP/4048). One frame = multiple <=1440B packets.
 - pace=Hz up-samples only (duplicates). If pace==0 or omitted, native cadence is used.
 """
@@ -17,7 +17,7 @@ import struct
 import subprocess
 import time
 import contextlib
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, unquote
 try:
     from urllib.request import url2pathname  # Windows-safe file:///C:/... -> C:\...
 except Exception:
@@ -28,6 +28,7 @@ import numpy as np
 import imageio.v3 as iio
 from PIL import Image, ImageOps
 import websockets
+from websockets.exceptions import ConnectionClosed, ConnectionClosedOK, ConnectionClosedError
 
 # Optional PyAV (preferred for videos/VFR)
 try:
@@ -110,26 +111,13 @@ def _resolve_local_path(srcu: str) -> Optional[str]:
 def _truthy(s: str) -> bool:
     return s.lower() not in ("0", "false", "no", "off", "")
 
-def _get_bool(q, key: str, default: bool) -> bool:
-    v = q.get(key, [None])[0]
-    return default if v is None else _truthy(str(v))
-
-def _get_int(q, key: str, default: int) -> int:
-    v = q.get(key, [None])[0]
+async def _ws_send(ws, obj) -> bool:
+    """Best-effort send; returns False if socket is gone."""
     try:
-        return int(v) if v is not None else default
-    except Exception:
-        return default
-
-def _get_float(q, key: str, default: float) -> float:
-    v = q.get(key, [None])[0]
-    try:
-        return float(v) if v is not None else default
-    except Exception:
-        return default
-
-async def _ws_send(ws, obj):
-    await ws.send(json.dumps(obj, separators=(",", ":")))
+        await ws.send(json.dumps(obj, separators=(",", ":")))
+        return True
+    except (ConnectionClosed, OSError):
+        return False
 
 def _require_fields(msg, fields, verb):
     missing = [f for f in fields if f not in msg]
@@ -396,11 +384,8 @@ async def _paced_sender(sock, addr, output_id, *, pace_hz, ema_alpha, get_latest
                 else:
                     ema_buf = (ema_buf.astype(np.float32) * (1.0 - ema_alpha) +
                                cur.astype(np.float32) * ema_alpha).astype(np.uint8)
-                # For “between-frame” ticks, send the ema_buf; otherwise latest.
                 payload = ema_buf.tobytes()
-            t0 = time.perf_counter()
             ddp_send_frame(sock, addr, payload, output_id, seq)
-            # (optional) you can add a per-tick log switch if needed
             seq = (seq + 1) & 0x0F
 
         next_tick += tick_s
@@ -461,7 +446,7 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
                 await producer()  # returns when source ends (or loops forever)
             finally:
                 sender_task.cancel()
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
                     await sender_task
 
         else:
@@ -470,11 +455,7 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
             next_deadline = loop_.time()
             seq = 0
             for rgb888, delay_ms in frames:
-                t0 = time.perf_counter()
                 ddp_send_frame(sock, addr, rgb888, out_id, seq)
-                if log_send:
-                    send_ms = int((time.perf_counter() - t0) * 1000)
-                    print(f"[ddp {out_id}] seq={seq} size={w}x{h} send={send_ms}ms bytes={len(rgb888)}")
                 next_deadline += max(1, int(delay_ms)) / 1000.0
                 sleep_for = max(0.0, next_deadline - loop_.time())
                 if sleep_for > 0:
@@ -488,6 +469,12 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
 # WebSocket control
 # =========================
 CONFIG: Dict[str, Any] = DEFAULT_CONFIG
+
+def _is_benign_disconnect(exc: BaseException) -> bool:
+    # Windows common transient network errors
+    if isinstance(exc, OSError) and getattr(exc, "winerror", None) in (64, 121):
+        return True
+    return isinstance(exc, (ConnectionClosedOK, ConnectionClosedError))
 
 async def handle_control(ws):
     """
@@ -509,6 +496,7 @@ async def handle_control(ws):
     """
     # one connection = one session; can host multiple outputs
     streams: dict[int, asyncio.Task] = {}
+    streams_lock = asyncio.Lock()
     session = {
         "device_id": None,
         "ip": getattr(ws, "remote_address", ("?",))[0],
@@ -518,15 +506,26 @@ async def handle_control(ws):
         _require_fields(msg, ("out","w","h","src"), "start_stream")
         out = int(msg["out"])
         w = int(msg["w"]); h = int(msg["h"])
+        if w <= 0 or h <= 0:
+            raise ValueError(f"start_stream requires positive w/h (got {w}x{h})")
         src = str(msg["src"])
         ddp_port = int(msg.get("ddp_port", 4048))
+
+        pace_val = msg.get("pace", 0)
+        try:
+            pace_hz = int(pace_val)
+        except Exception:
+            raise ValueError(f"pace must be integer Hz (got {pace_val!r})")
+        if pace_hz < 0:
+            raise ValueError("pace must be >= 0")
+
         opts = {
             "loop": _truthy(str(msg.get("loop", CONFIG["playback"]["loop"]))),
             "expand_mode": 2 if str(msg.get("expand", CONFIG["video"]["expand_mode"])) in ("2","force")
                             else (1 if str(msg.get("expand", CONFIG["video"]["expand_mode"])) not in ("0","false","never") else 0),
             "hw": (None if str(msg.get("hw", CONFIG["hw"]["prefer"])).lower() in ("none","off","cpu") else str(msg.get("hw", CONFIG["hw"]["prefer"]))),
             "log_send_ms": bool(CONFIG["log"].get("send_ms", False)),
-            "pace_hz": int(msg.get("pace", 0)),
+            "pace_hz": pace_hz,
             "ema_alpha": max(0.0, min(float(msg.get("ema", 0.0)), 1.0)),
         }
 
@@ -536,19 +535,21 @@ async def handle_control(ws):
         if local_path is not None and not os.path.exists(local_path):
             raise FileNotFoundError(f"no such file: {local_path}")
 
-        # stop any existing task for this out
-        t_old = streams.pop(out, None)
-        if t_old:
-            t_old.cancel()
-            with contextlib.suppress(Exception):
-                await t_old
+        # stop any existing task for this out (serialized)
+        async with streams_lock:
+            t_old = streams.pop(out, None)
+            if t_old:
+                t_old.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await t_old
 
         log = print  # simple logging style consistent with your file
         log(f"* start_stream {session['ip']} dev={session['device_id']} out={out} size={w}x{h} ddp_port={ddp_port} "
             f"src={src} pace={opts['pace_hz']} ema={opts['ema_alpha']} expand={opts['expand_mode']} loop={opts['loop']} hw={opts['hw']}")
 
         task = asyncio.create_task(ddp_task(session["ip"], ddp_port, out, size=(w, h), src=src, opts=opts))
-        streams[out] = task
+        async with streams_lock:
+            streams[out] = task
 
         await _ws_send(ws, {"type": "ack", "out": out, "applied": {
             "src": src, "pace": opts["pace_hz"], "ema": opts["ema_alpha"],
@@ -558,11 +559,12 @@ async def handle_control(ws):
     async def stop_stream(msg):
         _require_fields(msg, ("out",), "stop_stream")
         out = int(msg["out"])
-        t = streams.pop(out, None)
-        if t:
-            t.cancel()
-            with contextlib.suppress(Exception):
-                await t
+        async with streams_lock:
+            t = streams.pop(out, None)
+            if t:
+                t.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await t
         print(f"* stop_stream {session['ip']} dev={session['device_id']} out={out}")
         await _ws_send(ws, {"type": "ack", "out": out})
 
@@ -570,53 +572,47 @@ async def handle_control(ws):
         # apply deltas by reissuing start_stream with prior args (simple)
         _require_fields(msg, ("out",), "update")
         out = int(msg["out"])
-        if out not in streams:
-            raise ValueError(f"update for unknown out={out} (no active stream)")
+        async with streams_lock:
+            if out not in streams:
+                raise ValueError(f"update for unknown out={out} (no active stream)")
 
-        # We don't hold prior args here; simplest path is to stop+restart with new fields merged.
-        # To keep things minimal and explicit, require the fields you want to change to be sent.
-        # For typical use: send {type:update,out,src? ,pace?, ema?, expand?, loop?, hw?}
-        # We'll keep the last w/h/ddp_port by asking the client to also include them if needed.
-
-        # For minimal churn: allow updates for src/pace/ema/expand/loop/hw without w/h change.
-        # We need last w/h/ddp_port to restart correctly; request client to include them on update
-        # OR we can close+re-open without changing size if not provided: we assume size unchanged.
-        # We'll peek the running task? Not trivial, so require explicit size when changing it.
-
-        # Gather fields; fall back to "unchanged" by sending a partial ack.
+        # Gather fields to forward to start_stream; if size/port unchanged, client may omit them.
+        base = {"type": "start_stream", "out": out}
         applied = {}
-        if "src" in msg: applied["src"] = str(msg["src"])
-        if "pace" in msg: applied["pace"] = int(msg["pace"])
-        if "ema" in msg: applied["ema"] = float(msg["ema"])
-        if "expand" in msg: applied["expand"] = msg["expand"]
-        if "loop" in msg: applied["loop"] = bool(msg["loop"])
-        if "hw" in msg: applied["hw"] = (None if str(msg["hw"]).lower() in ("none","off","cpu") else str(msg["hw"]))
-
-        # Implement by stopping and immediately starting with merged args:
-        # For simplicity, require client to send w/h/ddp_port when size or port must change.
-        # Otherwise we reuse the last known w/h/ddp_port by keeping them cached on client side.
-        base = {"type":"start_stream","out":out}
         for k in ("w","h","ddp_port","src","pace","ema","expand","loop","hw"):
             if k in msg:
                 base[k] = msg[k]
+                applied[k] = msg[k]
 
         await stop_stream({"out": out})
         await start_stream(base)
 
-        await _ws_send(ws, {"type":"ack","out":out,"applied":applied})
+        await _ws_send(ws, {"type": "ack", "out": out, "applied": applied})
 
     # --- handshake: first message must be hello ---
     try:
         raw = await ws.recv()
         hello = json.loads(raw)
-        if hello.get("type") != "hello":
-            await _ws_send(ws, {"type":"error","code":"proto","message":"expect 'hello' first"})
-            await ws.close(code=4001, reason="protocol"); return
-        session["device_id"] = hello.get("device_id","unknown")
-        print(f"* hello from {session['ip']} dev={session['device_id']} proto={hello.get('proto')}")
-        await _ws_send(ws, {"type":"hello_ack","server_version":"lvgl-ddp-stream/1"})
+    except ConnectionClosed as e:
+        print(f"* disconnect during handshake from {session['ip']} ({getattr(e, 'code', '')} {getattr(e, 'reason', '')})")
+        return
+    except Exception as e:
+        await _ws_send(ws, {"type": "error", "code": "proto", "message": f"invalid hello: {e}"})
+        with contextlib.suppress(Exception):
+            await ws.close(code=4001, reason="protocol")
+        return
 
-        # main loop
+    if hello.get("type") != "hello":
+        await _ws_send(ws, {"type":"error","code":"proto","message":"expect 'hello' first"})
+        await ws.close(code=4001, reason="protocol")
+        return
+
+    session["device_id"] = hello.get("device_id","unknown")
+    print(f"* hello from {session['ip']} dev={session['device_id']} proto={hello.get('proto')}")
+    await _ws_send(ws, {"type":"hello_ack","server_version":"lvgl-ddp-stream/1"})
+
+    # main loop
+    try:
         async for raw in ws:
             try:
                 msg = json.loads(raw)
@@ -635,20 +631,35 @@ async def handle_control(ws):
                 await _ws_send(ws, {"type":"error","code":"bad_request","message":str(e)})
             except Exception as e:
                 await _ws_send(ws, {"type":"error","code":"server_error","message":str(e)})
+    except Exception as loop_exc:
+        # Downgrade common disconnects; keep concise.
+        if _is_benign_disconnect(loop_exc):
+            reason = getattr(loop_exc, 'reason', '') or (getattr(loop_exc, 'args', [''])[0])
+            print(f"* disconnect {session['ip']} ({type(loop_exc).__name__}: {reason})")
+        else:
+            print(f"[warn] control loop error from {session['ip']}: {loop_exc!r}")
     finally:
         # teardown all outputs on disconnect
-        for out, t in list(streams.items()):
-            t.cancel()
-        with contextlib.suppress(Exception):
-            await asyncio.gather(*streams.values(), return_exceptions=True)
-
+        async with streams_lock:
+            for out, t in list(streams.items()):
+                t.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                if streams:
+                    await asyncio.gather(*streams.values(), return_exceptions=True)
 
 async def dispatch(ws):
     path = getattr(getattr(ws, "request", None), "path", "/")
-    if path.startswith("/control"):
-        await handle_control(ws)
-    else:
-        await ws.close(code=4003, reason="unknown path")
+    try:
+        if str(path).startswith("/control"):
+            await handle_control(ws)
+        else:
+            await ws.close(code=4003, reason="unknown path")
+    except Exception as e:
+        # Prevent server-level tracebacks for normal disconnects
+        if not _is_benign_disconnect(e):
+            print(f"[warn] connection handler error: {e!r}")
+        with contextlib.suppress(Exception):
+            await ws.close()
 
 def _win_timer_res(enable=True):
     if os.name == "nt":
@@ -678,7 +689,8 @@ async def main():
         dispatch, args.host, args.port,
         max_size=2**22,
         compression=None,
-        ping_interval=20, ping_timeout=20
+        ping_interval=20, ping_timeout=20,
+        close_timeout=1.0
     ):
         await asyncio.Future()
 
