@@ -12,10 +12,6 @@ namespace ddp_stream {
 
 static const char* TAG = "ddp_stream";
 
-static inline uint16_t rgb888_to_565(uint8_t r, uint8_t g, uint8_t b) {
-  return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
-}
-
 // -------- public API --------
 
 void DdpStream::add_stream_binding(uint8_t id,
@@ -90,30 +86,31 @@ void DdpStream::dump_config() {
 }
 
 void DdpStream::loop() {
+  // Present any completed frames on LVGL thread
   for (auto &kv : bindings_) {
     Binding &b = kv.second;
-    if (b.have_new.exchange(false)) {
-      b.front.swap(b.back);
-      if (!b.canvas) continue;
-      int cw = (int) lv_obj_get_width(b.canvas);
-      int ch = (int) lv_obj_get_height(b.canvas);
-      int w  = (b.w > 0) ? std::min(cw, b.w) : cw;
-      int h  = (b.h > 0) ? std::min(ch, b.h) : ch;
-      if (w <= 0 || h <= 0) continue;
 
-#if defined(LV_COLOR_16_SWAP) && LV_COLOR_16_SWAP
-      tmp_.resize((size_t) w * h);
-      for (int i = 0; i < w * h; ++i) {
-        uint16_t c = b.front[i];
-        tmp_[i] = (uint16_t)((c >> 8) | (c << 8));
-      }
-      lv_canvas_copy_buf(b.canvas, tmp_.data(), 0, 0, w, h);
-#else
-      lv_canvas_copy_buf(b.canvas, b.front.data(), 0, 0, w, h);
-#endif
-      lv_area_t a; a.x1 = 0; a.y1 = 0; a.x2 = w - 1; a.y2 = h - 1;
-      lv_obj_invalidate_area(b.canvas, &a);
-    }
+    // quick reject: nothing new
+    if (!b.have_new.exchange(false))
+      continue;
+
+    // must have a canvas and resolved size
+    if (!b.canvas || b.w <= 0 || b.h <= 0)
+      continue;
+
+    // flip buffers; decoder already wrote in LVGL's byte order
+    b.front.swap(b.back);
+
+    const int w = b.w;
+    const int h = b.h;
+
+    // copy to canvas and invalidate just the updated area
+    lv_canvas_copy_buf(b.canvas, b.front.data(), 0, 0, w, h);
+
+    lv_area_t a;
+    a.x1 = 0; a.y1 = 0;
+    a.x2 = w - 1; a.y2 = h - 1;
+    lv_obj_invalidate_area(b.canvas, &a);
   }
 }
 
@@ -130,13 +127,19 @@ void DdpStream::ensure_socket_() {
 
 void DdpStream::open_socket_() {
   if (sock_ >= 0) return;
+
+  // Create UDP socket
   int s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
   if (s < 0) {
     ESP_LOGW(TAG, "socket() failed errno=%d", errno);
     return;
   }
+
+  // Allow quick rebinds after restart
   int yes = 1;
-  setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+  (void) setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+  // Bind to INADDR_ANY:port_
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -146,16 +149,21 @@ void DdpStream::open_socket_() {
     ::close(s);
     return;
   }
+
   sock_ = s;
+
   if (!udp_opened_) {
     ESP_LOGI(TAG, "DDP listening on UDP %u", port_);
     udp_opened_ = true;
   }
+
+  // Start RX task
   if (task_ == nullptr) {
     xTaskCreatePinnedToCore(&DdpStream::recv_task_trampoline, "ddp_rx",
                             4096, this, 5, &task_, tskNO_AFFINITY);
   }
 }
+
 
 void DdpStream::close_socket_() {
   if (task_ != nullptr) {
@@ -250,38 +258,68 @@ void DdpStream::on_canvas_size_changed_(lv_event_t *e) {
 
 // -------- DDP decoder --------
 
+static inline uint16_t rgb888_to_565(uint8_t r, uint8_t g, uint8_t b) {
+  return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+
 void DdpStream::handle_packet_(const uint8_t *raw, size_t n) {
-  if (n < sizeof(DdpHeader)) return;
+  // A DDP packet = 1 header + 0..1440 payload bytes.
+  // Multiple packets make up a full frame (RGB888).
+
+  if (n < sizeof(DdpHeader)) return;           // too short to even hold a header
   auto *h = reinterpret_cast<const DdpHeader*>(raw);
-  bool ver  = (h->flags & 0x40) != 0;
-  bool push = (h->flags & 0x01) != 0;
-  if (!ver) return;
-  uint8_t id = h->id;
+
+  // --- 1) Basic header checks ---
+  bool ver  = (h->flags & 0x40) != 0;          // bit 6 must be set for "DDP data"
+  bool push = (h->flags & 0x01) != 0;          // bit 0 = "PUSH": last packet of frame
+  if (!ver) return;                            // ignore non-DDP data packets
+
+  uint8_t id = h->id;                          // stream/output id (0–255)
   Binding *b = this->find_binding_(id);
-  if (!b || !b->canvas || b->w <= 0 || b->h <= 0) return;
-  uint32_t offset = ntohl(h->offset_be);
-  uint16_t len    = ntohs(h->length_be);
+  if (!b || !b->canvas || b->w <= 0 || b->h <= 0) return;  // not bound yet
+
+  // --- 2) Offset/length ---
+  uint32_t offset = ntohl(h->offset_be);       // byte offset in the frame
+  uint16_t len    = ntohs(h->length_be);       // payload length in bytes
   if (len == 0) return;
-  if (sizeof(DdpHeader) + len > n) return;
-  const uint8_t* p = raw + sizeof(DdpHeader);
+  if (sizeof(DdpHeader) + len > n) return;     // truncated packet
+
+  const uint8_t* p = raw + sizeof(DdpHeader);  // pointer to pixel data
+
+  // --- 3) Validate alignment ---
+  // This implementation expects RGB888 (3 bytes per pixel).
   if ((offset % 3) != 0 || (len % 3) != 0) return;
-  size_t pixel_off = offset / 3;
-  size_t px        = len / 3;
+
+  size_t pixel_off = offset / 3;               // starting pixel index
+  size_t px        = len / 3;                  // number of pixels in this packet
   size_t max_px    = (size_t) b->w * (size_t) b->h;
-  if (pixel_off >= max_px) return;
+  if (pixel_off >= max_px) return;             // starts outside canvas
   size_t write_px  = std::min(px, max_px - pixel_off);
+
+  // --- 4) Ensure buffers are sized ---
   this->ensure_binding_buffers_(*b);
   if (b->back.empty()) return;
+
+  // --- 5) Convert RGB888 -> RGB565 (with optional LVGL byte swap) ---
   uint16_t* dst = b->back.data() + pixel_off;
+  const uint8_t* sp = p;
   for (size_t i = 0; i < write_px; ++i) {
-    uint8_t r = p[3*i+0], g = p[3*i+1], b8 = p[3*i+2];
-    dst[i] = rgb888_to_565(r, g, b8);
+    const uint16_t c = rgb888_to_565(sp[0], sp[1], sp[2]);  // 24-bit → 16-bit
+#if defined(LV_COLOR_16_SWAP) && LV_COLOR_16_SWAP
+    dst[i] = (uint16_t)((c >> 8) | (c << 8));           // swap bytes if LVGL configured so
+#else
+    dst[i] = c;
+#endif
+    sp += 3;
   }
+
+  // --- 6) If PUSH flag set, mark frame as ready for display ---
   if (push) {
-    b->last_seq = h->seq;
-    b->have_new.store(true);
+    b->last_seq = h->seq;                     // sequence number from header
+    b->have_new.store(true);                  // signal loop() to flip buffers & blit
   }
 }
+
 
 } // namespace ddp_stream
 } // namespace esphome

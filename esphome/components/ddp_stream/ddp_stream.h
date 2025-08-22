@@ -102,7 +102,6 @@ class DdpStream : public Component {
   TaskHandle_t task_{nullptr};
 
   bool udp_opened_{false};
-  std::vector<uint16_t> tmp_;
   std::map<uint8_t, Binding> bindings_;
 };
 
