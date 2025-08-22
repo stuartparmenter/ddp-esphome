@@ -128,6 +128,14 @@ def _get_float(q, key: str, default: float) -> float:
     except Exception:
         return default
 
+async def _ws_send(ws, obj):
+    await ws.send(json.dumps(obj, separators=(",", ":")))
+
+def _require_fields(msg, fields, verb):
+    missing = [f for f in fields if f not in msg]
+    if missing:
+        raise ValueError(f"{verb} requires {', '.join(fields)} (missing: {', '.join(missing)})")
+
 def _ffmpeg_has_hwaccel(name: str) -> bool:
     exe = shutil.which("ffmpeg")
     if not exe:
@@ -482,64 +490,158 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
 CONFIG: Dict[str, Any] = DEFAULT_CONFIG
 
 async def handle_control(ws):
-    path = getattr(getattr(ws, "request", None), "path", "/")
-    q = parse_qs(urlparse(path).query)
-    try:
-        w   = int(q.get("w",   ["64"])[0])
-        h   = int(q.get("h",   ["64"])[0])
-        out = int(q.get("out", ["1"])[0])
-        src = q.get("src", [""])[0]
-        ddp_port = int(q.get("ddp_port", ["4048"])[0])
-        if not src:
-            ip = getattr(ws, "remote_address", ("?",))[0]
-            print(f"! control error from {ip}: missing src (path='{path}')")
-            await ws.close(code=4001, reason="missing src"); return
-        if not (1 <= w <= 255 and 1 <= h <= 255 and 0 <= out <= 255):
-            ip = getattr(ws, "remote_address", ("?",))[0]
-            print(f"! control error from {ip}: bad dimensions/out (w={w}, h={h}, out={out}, path='{path}')")
-            await ws.close(code=4002, reason="bad dimensions or out"); return
-    except Exception:
-        ip = getattr(ws, "remote_address", ("?",))[0]
-        print(f"! control error from {ip}: bad query ({e!r}) (path='{path}')")
-        await ws.close(code=4000, reason="bad query"); return
+    """
+    New protocol (message-based on a single WS):
+      -> hello { proto:"ddp-ws/1", device_id?, caps? }
+      <- hello_ack { server_version }
 
-    # Early local-file fail
-    srcu = unquote(src)
-    local_path = _resolve_local_path(srcu)
-    if local_path is not None and not os.path.exists(local_path):
-        await ws.close(code=4404, reason=f"no such file: {local_path}"); return
+      -> start_stream { out,w,h,src, ddp_port?, pace?, ema?, expand?, loop?, hw? }
+      <- ack { out, applied:{...} }
 
-    # expand: 0=never, 1=auto, 2=force
-    expand_flag = q.get("expand", [str(CONFIG["video"]["expand_mode"])])[0]
-    expand_mode = 2 if expand_flag in ("2", "force") else (1 if expand_flag not in ("0","false","False") else 0)
+      -> update { out, src?, pace?, ema?, expand?, loop?, hw? }
+      <- ack { out, applied:{...} }
 
-    loop_video = _get_bool(q, "loop", bool(CONFIG["playback"]["loop"]))
+      -> stop_stream { out }
+      <- ack { out }
 
-    hw_prefer = q.get("hw", [str(CONFIG["hw"]["prefer"])])[0]
-    if hw_prefer.lower() in ("none", "off", "cpu"):
-        hw_prefer = None
-
-    pace_hz = _get_int(q, "pace", 0)  # upsample only
-    ema_alpha = _get_float(q, "ema", 0.0)
-
-    opts = {
-        "loop": loop_video,
-        "expand_mode": expand_mode,
-        "hw": hw_prefer,
-        "log_send_ms": bool(CONFIG["log"].get("send_ms", False)),
-        "pace_hz": pace_hz,
-        "ema_alpha": max(0.0, min(ema_alpha, 1.0)),
+      -> ping { t }
+      <- pong { t }
+    """
+    # one connection = one session; can host multiple outputs
+    streams: dict[int, asyncio.Task] = {}
+    session = {
+        "device_id": None,
+        "ip": getattr(ws, "remote_address", ("?",))[0],
     }
 
-    target_ip = ws.remote_address[0]
-    print(f"* control from {target_ip}: out={out} size={w}x{h} ddp_port={ddp_port} "
-          f"src={src} pace={pace_hz} ema={opts['ema_alpha']}")
-    task = asyncio.create_task(ddp_task(target_ip, ddp_port, out, size=(w, h), src=src, opts=opts))
+    async def start_stream(msg):
+        _require_fields(msg, ("out","w","h","src"), "start_stream")
+        out = int(msg["out"])
+        w = int(msg["w"]); h = int(msg["h"])
+        src = str(msg["src"])
+        ddp_port = int(msg.get("ddp_port", 4048))
+        opts = {
+            "loop": _truthy(str(msg.get("loop", CONFIG["playback"]["loop"]))),
+            "expand_mode": 2 if str(msg.get("expand", CONFIG["video"]["expand_mode"])) in ("2","force")
+                            else (1 if str(msg.get("expand", CONFIG["video"]["expand_mode"])) not in ("0","false","never") else 0),
+            "hw": (None if str(msg.get("hw", CONFIG["hw"]["prefer"])).lower() in ("none","off","cpu") else str(msg.get("hw", CONFIG["hw"]["prefer"]))),
+            "log_send_ms": bool(CONFIG["log"].get("send_ms", False)),
+            "pace_hz": int(msg.get("pace", 0)),
+            "ema_alpha": max(0.0, min(float(msg.get("ema", 0.0)), 1.0)),
+        }
 
+        # Validate local file early if file:// or path
+        srcu = unquote(src)
+        local_path = _resolve_local_path(srcu)
+        if local_path is not None and not os.path.exists(local_path):
+            raise FileNotFoundError(f"no such file: {local_path}")
+
+        # stop any existing task for this out
+        t_old = streams.pop(out, None)
+        if t_old:
+            t_old.cancel()
+            with contextlib.suppress(Exception):
+                await t_old
+
+        log = print  # simple logging style consistent with your file
+        log(f"* start_stream {session['ip']} dev={session['device_id']} out={out} size={w}x{h} ddp_port={ddp_port} "
+            f"src={src} pace={opts['pace_hz']} ema={opts['ema_alpha']} expand={opts['expand_mode']} loop={opts['loop']} hw={opts['hw']}")
+
+        task = asyncio.create_task(ddp_task(session["ip"], ddp_port, out, size=(w, h), src=src, opts=opts))
+        streams[out] = task
+
+        await _ws_send(ws, {"type": "ack", "out": out, "applied": {
+            "src": src, "pace": opts["pace_hz"], "ema": opts["ema_alpha"],
+            "expand": opts["expand_mode"], "loop": opts["loop"], "hw": opts["hw"],
+        }})
+
+    async def stop_stream(msg):
+        _require_fields(msg, ("out",), "stop_stream")
+        out = int(msg["out"])
+        t = streams.pop(out, None)
+        if t:
+            t.cancel()
+            with contextlib.suppress(Exception):
+                await t
+        print(f"* stop_stream {session['ip']} dev={session['device_id']} out={out}")
+        await _ws_send(ws, {"type": "ack", "out": out})
+
+    async def update_stream(msg):
+        # apply deltas by reissuing start_stream with prior args (simple)
+        _require_fields(msg, ("out",), "update")
+        out = int(msg["out"])
+        if out not in streams:
+            raise ValueError(f"update for unknown out={out} (no active stream)")
+
+        # We don't hold prior args here; simplest path is to stop+restart with new fields merged.
+        # To keep things minimal and explicit, require the fields you want to change to be sent.
+        # For typical use: send {type:update,out,src? ,pace?, ema?, expand?, loop?, hw?}
+        # We'll keep the last w/h/ddp_port by asking the client to also include them if needed.
+
+        # For minimal churn: allow updates for src/pace/ema/expand/loop/hw without w/h change.
+        # We need last w/h/ddp_port to restart correctly; request client to include them on update
+        # OR we can close+re-open without changing size if not provided: we assume size unchanged.
+        # We'll peek the running task? Not trivial, so require explicit size when changing it.
+
+        # Gather fields; fall back to "unchanged" by sending a partial ack.
+        applied = {}
+        if "src" in msg: applied["src"] = str(msg["src"])
+        if "pace" in msg: applied["pace"] = int(msg["pace"])
+        if "ema" in msg: applied["ema"] = float(msg["ema"])
+        if "expand" in msg: applied["expand"] = msg["expand"]
+        if "loop" in msg: applied["loop"] = bool(msg["loop"])
+        if "hw" in msg: applied["hw"] = (None if str(msg["hw"]).lower() in ("none","off","cpu") else str(msg["hw"]))
+
+        # Implement by stopping and immediately starting with merged args:
+        # For simplicity, require client to send w/h/ddp_port when size or port must change.
+        # Otherwise we reuse the last known w/h/ddp_port by keeping them cached on client side.
+        base = {"type":"start_stream","out":out}
+        for k in ("w","h","ddp_port","src","pace","ema","expand","loop","hw"):
+            if k in msg:
+                base[k] = msg[k]
+
+        await stop_stream({"out": out})
+        await start_stream(base)
+
+        await _ws_send(ws, {"type":"ack","out":out,"applied":applied})
+
+    # --- handshake: first message must be hello ---
     try:
-        await ws.wait_closed()
+        raw = await ws.recv()
+        hello = json.loads(raw)
+        if hello.get("type") != "hello":
+            await _ws_send(ws, {"type":"error","code":"proto","message":"expect 'hello' first"})
+            await ws.close(code=4001, reason="protocol"); return
+        session["device_id"] = hello.get("device_id","unknown")
+        print(f"* hello from {session['ip']} dev={session['device_id']} proto={hello.get('proto')}")
+        await _ws_send(ws, {"type":"hello_ack","server_version":"lvgl-ddp-stream/1"})
+
+        # main loop
+        async for raw in ws:
+            try:
+                msg = json.loads(raw)
+                t = msg.get("type")
+                if t == "start_stream":
+                    await start_stream(msg)
+                elif t == "stop_stream":
+                    await stop_stream(msg)
+                elif t == "update":
+                    await update_stream(msg)
+                elif t == "ping":
+                    await _ws_send(ws, {"type":"pong","t": msg.get("t")})
+                else:
+                    await _ws_send(ws, {"type":"error","code":"bad_type","message":f"unknown type {t}"})
+            except (ValueError, FileNotFoundError) as e:
+                await _ws_send(ws, {"type":"error","code":"bad_request","message":str(e)})
+            except Exception as e:
+                await _ws_send(ws, {"type":"error","code":"server_error","message":str(e)})
     finally:
-        task.cancel()
+        # teardown all outputs on disconnect
+        for out, t in list(streams.items()):
+            t.cancel()
+        with contextlib.suppress(Exception):
+            await asyncio.gather(*streams.values(), return_exceptions=True)
+
 
 async def dispatch(ws):
     path = getattr(getattr(ws, "request", None), "path", "/")
@@ -571,7 +673,7 @@ async def main():
     CONFIG = load_config(args.config)
     print(f"* loaded config: {CONFIG}")
 
-    print("* ws_ddp_proxy on ws://{}:{}/control?w=..&h=..&out=..&src=..".format(args.host, args.port))
+    print("* ws_ddp_proxy on ws://{}:{}/control  (protocol: hello, start_stream, update, stop_stream, ping/pong)".format(args.host, args.port))
     async with websockets.serve(
         dispatch, args.host, args.port,
         max_size=2**22,

@@ -31,69 +31,53 @@ namespace ddp_stream {
 // -------- DDP header (packed, big-endian fields) --------
 #pragma pack(push, 1)
 struct DdpHeader {
-  uint8_t  flags;     // 0x40=data, bit0=PUSH
-  uint8_t  seq;       // low 4 bits sequence
-  uint8_t  pixcfg;    // e.g. 0x2C for RGB888 (per your sender)
-  uint8_t  id;        // stream/output id
-  uint32_t offset_be; // big-endian byte offset
+  uint8_t  flags;        // 0x40=data, bit0=PUSH
+  uint8_t  seq;          // low 4 bits sequence
+  uint8_t  pixcfg;       // e.g. 0x2C for RGB888
+  uint8_t  id;           // stream/output id
+  uint32_t offset_be;    // big-endian byte offset
   uint16_t length_be;    // big-endian payload length
 };
 #pragma pack(pop)
-
-// Optional helpers if you need host-endian values in .cpp
-static inline uint16_t be16toh_u16(uint16_t x) {
-  return (uint16_t)(((x & 0x00FFu) << 8) | ((x & 0xFF00u) >> 8));
-}
-static inline uint32_t be32toh_u32(uint32_t x) {
-  return ((x & 0x000000FFu) << 24) |
-         ((x & 0x0000FF00u) <<  8) |
-         ((x & 0x00FF0000u) >>  8) |
-         ((x & 0xFF000000u) >> 24);
-}
 
 class DdpStream : public Component {
  public:
   // ---- Public configuration ----
   void set_port(uint16_t p) { port_ = p; }
+  uint16_t get_port() const { return port_; }
 
-  // Immediate bind (kept for compatibility; safe to call from on_load)
-  void set_stream_canvas(uint8_t id, lv_obj_t* canvas, int w, int h);
-
-  // Declarative/deferred bind (for YAML `streams:`)
+  // Bind canvas by getter; if w/h == -1 we auto-resolve from LVGL when available.
   void add_stream_binding(uint8_t id,
                           std::function<lv_obj_t*()> getter,
-                          int w, int h) {
-    pending_.push_back({id, std::move(getter), w, h});
-  }
+                          int w /* = -1 */, int h /* = -1 */);
+
+  // Immediate bind (rarely needed; safe to call from on_load)
+  void set_stream_canvas(uint8_t id, lv_obj_t* canvas, int w, int h);
+
+  // Query the resolved size (returns false if canvas not ready yet).
+  bool get_stream_size(uint8_t id, int *w, int *h) const;
 
   // ---- ESPHome lifecycle ----
-  void setup() override;          // opens socket (via ensure_socket_) and schedules deferred binds
+  void setup() override;          // opens socket (via ensure_socket_) and resolves bindings
   void dump_config() override;
-  void loop() override;           // RX handled in a task; declared (not inlined) to avoid ODR clash
+  void loop() override;           // flips front/back and blits to LVGL
   float get_setup_priority() const override {
-    // Run late so LVGL can construct pages; we still defer binds below.
+    // Run late so LVGL can construct pages; we still resolve canvases/sizes in intervals.
     return setup_priority::LATE;
   }
 
  private:
-  // ------------------- DDP sink (per stream id) -------------------
-  struct StreamSink {
-    lv_obj_t* canvas{nullptr};
-    int w{0}, h{0};
-    std::vector<uint16_t> front;     // RGB565
-    std::vector<uint16_t> back;      // RGB565
+  // ------------------- Binding (per output id) -------------------
+  struct Binding {
+    std::function<lv_obj_t*()> getter;   // returns &id(canvas)
+    lv_obj_t* canvas{nullptr};           // cached when available
+    int w{-1}, h{-1};                    // -1 => auto from LVGL object
+    std::vector<uint16_t> front;         // RGB565
+    std::vector<uint16_t> back;          // RGB565
     std::atomic<bool> have_new{false};
     uint8_t last_seq{0};
+    bool ready{false};                   // true once canvas, size, and buffers are set
   };
-
-  // ------------------- Deferred binding -------------------
-  struct Pending {
-    uint8_t id;
-    std::function<lv_obj_t*()> getter;   // returns &id(canvas)
-    int w, h;
-  };
-  std::vector<Pending> pending_;
-  void process_pending_();               // resolves getters once LVGL widgets exist
 
   // ------------------- Networking -------------------
   void ensure_socket_();                 // open/close socket as needed
@@ -101,22 +85,25 @@ class DdpStream : public Component {
   void close_socket_();                  // stop RX task, close socket
 
   static void recv_task_trampoline(void* arg);
-  void recv_task();                      // blocking UDP loop, decodes DDP, flips buffers
+  void recv_task();                      // blocking UDP loop, decodes DDP, writes into back
 
-  // ------------------- Helpers -------------------
-  static inline uint16_t rgb888_to_565(uint8_t r, uint8_t g, uint8_t b) {
-    return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
-  }
+  // ------------------- Binding helpers -------------------
+  void bind_if_possible_(Binding &b);    // attempt full bind
+  void ensure_binding_buffers_(Binding &b);
+  static void on_canvas_size_changed_(lv_event_t *e);
+
+  Binding* find_binding_(uint8_t id);    // nullptr if not found
+
+  void handle_packet_(const uint8_t *buf, size_t len); // decoder
 
   // ------------------- State -------------------
   uint16_t port_{4048};
   int sock_{-1};
   TaskHandle_t task_{nullptr};
 
-  // swap helper if LV_COLOR_16_SWAP is set (used during blit)
+  bool udp_opened_{false};
   std::vector<uint16_t> tmp_;
-
-  std::map<uint8_t, StreamSink> sinks_;
+  std::map<uint8_t, Binding> bindings_;
 };
 
 }  // namespace ddp_stream

@@ -1,83 +1,89 @@
 # © Copyright 2025 Stuart Parmenter
 # SPDX-License-Identifier: MIT
 
-from esphome import codegen as cg
-import esphome.config_validation as cv
-from esphome.const import (
-    CONF_ID, CONF_URL, CONF_PORT
-)
+from esphome import codegen as cg, config_validation as cv
+from esphome.const import CONF_ID, CONF_URL
 from esphome.components.esp32 import add_idf_component
+
+# We require the base sink + LVGL so we can query canvas size
+DEPENDENCIES = ["network", "lvgl", "ddp_stream"]
 
 ws_ns = cg.esphome_ns.namespace("ws_ddp_control")
 WsDdpControl = ws_ns.class_("WsDdpControl", cg.Component)
 
-# New optional fields; if url is omitted we build one from these
+ddp_ns = cg.esphome_ns.namespace("ddp_stream")
+DdpStream = ddp_ns.class_("DdpStream", cg.Component)
+
 CONF_WS_HOST   = "ws_host"
 CONF_WS_PORT   = "ws_port"
-CONF_WIDTH     = "width"
-CONF_HEIGHT    = "height"
-CONF_OUT       = "out"
-CONF_SRC       = "src"
-CONF_PACE      = "pace"
-CONF_EMA       = "ema"
-CONF_EXPAND    = "expand"   # 0|1|2 or "never|auto|force"
-CONF_LOOP      = "loop"
-CONF_DDP_PORT  = "ddp_port"
-CONF_HW        = "hw"       # "auto|cuda|qsv|vaapi|videotoolbox|none"
+CONF_DEVICE_ID = "device_id"
+CONF_DDP       = "ddp"
+CONF_OUTPUTS   = "outputs"
 
-ITEM_SCHEMA = cv.Schema({
+OUTPUT_SCHEMA = cv.Schema({
+    cv.Required("id"): cv.int_range(min=0, max=255),
+    # Width/height optional; if omitted we auto-detect from the canvas via ddp_stream
+    cv.Optional("width"): cv.int_range(min=1, max=4096),
+    cv.Optional("height"): cv.int_range(min=1, max=4096),
+
+    # Orchestration defaults (all can be changed at runtime via setters)
+    cv.Optional("src", default=""): cv.string,
+    cv.Optional("pace", default=0): cv.int_range(min=0, max=240),
+    cv.Optional("ema", default=0.0): cv.float_range(min=0.0, max=1.0),
+    # expand: 0=never, 1=auto, 2=force
+    cv.Optional("expand", default="auto"): cv.one_of(0, 1, 2, "never", "auto", "force", lower=True),
+    cv.Optional("loop", default=True): cv.boolean,
+    cv.Optional("hw", default="auto"): cv.one_of(
+        "auto", "none", "cuda", "qsv", "vaapi", "videotoolbox", "d3d11va", lower=True
+    ),
+})
+
+CONFIG_SCHEMA = cv.Schema({
     cv.GenerateID(CONF_ID): cv.declare_id(WsDdpControl),
+    # URL override (optional)
     cv.Optional(CONF_URL, default=""): cv.templatable(cv.string),
-
     cv.Optional(CONF_WS_HOST): cv.templatable(cv.string),
     cv.Optional(CONF_WS_PORT, default=8788): cv.int_range(min=1, max=65535),
-    cv.Optional(CONF_WIDTH, default=64): cv.int_range(min=1, max=255),
-    cv.Optional(CONF_HEIGHT, default=64): cv.int_range(min=1, max=255),
-    cv.Optional(CONF_OUT, default=1): cv.int_range(min=0, max=255),
-    cv.Optional(CONF_SRC, default=""): cv.templatable(cv.string),
+    cv.Optional(CONF_DEVICE_ID, default="unknown"): cv.templatable(cv.string),
 
-    cv.Optional(CONF_PACE, default=0): cv.int_range(min=0, max=240),
-    cv.Optional(CONF_EMA, default=0.0): cv.float_range(min=0.0, max=1.0),
-    cv.Optional(CONF_EXPAND, default="auto"): cv.one_of(0,1,2,"never","auto","force", lower=True),
-    cv.Optional(CONF_LOOP, default=True): cv.boolean,
-    cv.Optional(CONF_DDP_PORT, default=4048): cv.port,
-    cv.Optional(CONF_HW, default="auto"): cv.one_of("auto","none","cuda","qsv","vaapi","videotoolbox","d3d11va", lower=True),
+    # Orchestration
+    cv.Required(CONF_DDP): cv.use_id(DdpStream),
+    cv.Optional(CONF_OUTPUTS, default=[]): cv.ensure_list(OUTPUT_SCHEMA),
 }).extend(cv.COMPONENT_SCHEMA)
-
-CONFIG_SCHEMA = cv.All(cv.ensure_list(ITEM_SCHEMA))
 
 def _templ(expr):
     return cg.templatable(expr, [], cg.std_string)
 
 async def to_code(config):
-    for conf in config:
-        var = cg.new_Pvariable(conf[CONF_ID])
-        await cg.register_component(var, conf)
+    var = cg.new_Pvariable(config[CONF_ID])
+    await cg.register_component(var, config)
 
-        # keep existing url path working
-        url_expr = await _templ(conf.get(CONF_URL, ""))
-        cg.add(var.set_url(url_expr))
+    # Networking / socket config
+    cg.add(var.set_url(await _templ(config.get(CONF_URL, ""))))
+    if CONF_WS_HOST in config:
+        cg.add(var.set_ws_host(await _templ(config[CONF_WS_HOST])))
+    cg.add(var.set_ws_port(config.get(CONF_WS_PORT, 8788)))
+    cg.add(var.set_device_id(await _templ(config.get(CONF_DEVICE_ID, "unknown"))))
 
-        # Pass structured fields down; the C++ will build URL if url is empty
-        if CONF_WS_HOST in conf:
-            cg.add(var.set_ws_host(await _templ(conf[CONF_WS_HOST])))
-        cg.add(var.set_ws_port(conf.get(CONF_WS_PORT, 8788)))
-        cg.add(var.set_width(conf.get(CONF_WIDTH, 64)))
-        cg.add(var.set_height(conf.get(CONF_HEIGHT, 64)))
-        cg.add(var.set_out_id(conf.get(CONF_OUT, 1)))
-        if CONF_SRC in conf:
-            cg.add(var.set_src(await _templ(conf[CONF_SRC])))
+    # Bind ddp sink
+    ddp = await cg.get_variable(config[CONF_DDP])
+    cg.add(var.set_ddp(ddp))
 
-        cg.add(var.set_pace(conf.get(CONF_PACE, 0)))
-        cg.add(var.set_ema(conf.get(CONF_EMA, 0.0)))
-        # normalize expand into 0/1/2 for C++
-        exp = conf.get(CONF_EXPAND, "auto")
-        exp_i = 1 if isinstance(exp, str) and exp.lower()=="auto" else (2 if exp in (2,"force") else 0)
-        cg.add(var.set_expand(exp_i))
+    # Outputs with optional explicit w/h (pass -1 to auto-detect)
+    for s in config[CONF_OUTPUTS]:
+        exp = s.get("expand", "auto")
+        exp_i = 1 if isinstance(exp, str) and exp.lower() == "auto" else (2 if exp in (2, "force") else 0)
+        cg.add(var.add_output(
+            s["id"],
+            s.get("width", -1),
+            s.get("height", -1),
+            s.get("src", ""),
+            s.get("pace", 0),
+            s.get("ema", 0.0),
+            exp_i,
+            s.get("loop", True),
+            s.get("hw", "auto"),
+        ))
 
-        cg.add(var.set_loop(conf.get(CONF_LOOP, True)))
-        cg.add(var.set_ddp_port(conf.get(CONF_DDP_PORT, 4048)))
-        cg.add(var.set_hw(await _templ(conf.get(CONF_HW, "auto"))))
-
-        # ensure esp_websocket_client (ESP‑IDF)
-        add_idf_component(name="espressif/esp_websocket_client", ref="1.5.0")
+    # Ensure esp_websocket_client is linked
+    add_idf_component(name="espressif/esp_websocket_client", ref="1.5.0")
