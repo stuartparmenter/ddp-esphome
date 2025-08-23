@@ -1,21 +1,7 @@
+
 # © Copyright 2025 Stuart Parmenter
 # SPDX-License-Identifier: MIT
 #!/usr/bin/env python3
-"""
-server.py
-- WebSocket control at /control (JSON messages: hello, start_stream, update, stop_stream, ping)
-- Sends full RGB888 frames via DDP (UDP/4048). One frame = multiple <=1440B packets.
-- pace=Hz up-samples only (duplicates). If pace==0 or omitted, native cadence is used.
-
-Notes on DDP packet format used here (network byte order):
-  flags (1): bit6=DDP (0x40), bit0=PUSH (set on last packet of a frame)
-  seq   (1): 0..255 (we locally wrap 0..15 to match common DDP practice)
-  pix   (1): 0x2C (RGB, 8 bpc)
-  out   (1): output id (0..255)
-  off   (4): byte offset in the full frame payload (RGB888 byte space)
-  len   (2): payload bytes in this packet (<= 1440)
-We keep UDP payload <=1440 for safety on 1500-byte MTU links.
-"""
 
 import asyncio
 import json
@@ -26,11 +12,12 @@ import struct
 import subprocess
 import time
 import contextlib
+import traceback
 from urllib.parse import urlparse, unquote
 try:
-    from urllib.request import url2pathname  # Windows-safe file:///C:/... -> C:\...
+    from urllib.request import url2pathname
 except Exception:
-    def url2pathname(p): return p  # fallback
+    def url2pathname(p): return p
 from typing import Tuple, Optional, Dict, Any
 
 import numpy as np
@@ -39,21 +26,55 @@ from PIL import Image, ImageOps
 import websockets
 from websockets.exceptions import ConnectionClosed, ConnectionClosedOK, ConnectionClosedError
 
-# Optional PyAV (preferred for videos/VFR)
-try:
-    import av  # PyAV
-    _HAVE_PYAV = True
-except Exception:
-    _HAVE_PYAV = False
+import av
+from av.filter import Graph as AvFilterGraph
+av.logging.set_level(av.logging.INFO)
 
-MIN_DELAY_MS = 10
+# -------------------------
+# Metrics helpers
+# -------------------------
+
+class _RateMeter:
+    """Rolling rate/jitter meter using a short timestamp window."""
+    def __init__(self, window_s: float = 2.5):
+        self.window_s = float(window_s)
+        self.ts: list[float] = []
+
+    def tick(self, t: float) -> None:
+        self.ts.append(t)
+        cut = t - self.window_s
+        i = 0
+        for i, v in enumerate(self.ts):
+            if v >= cut:
+                break
+        if i > 0:
+            del self.ts[:i]
+
+    def rate_hz(self) -> float:
+        n = len(self.ts)
+        if n < 2:
+            return 0.0
+        duration = self.ts[-1] - self.ts[0]
+        return (n - 1) / duration if duration > 0 else 0.0
+
+    def jitter_ms(self) -> float:
+        import math
+        n = len(self.ts)
+        if n < 3:
+            return 0.0
+        diffs = [ (self.ts[i] - self.ts[i-1]) for i in range(1, n) ]
+        mean = sum(diffs) / len(diffs)
+        var = sum((d - mean)**2 for d in diffs) / (len(diffs) - 1)
+        return math.sqrt(var) * 1000.0
+
+MIN_DELAY_MS = 10.0  # float ms
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "hw": {"prefer": "auto"},
     "video": {"expand_mode": 1},  # 0=never, 1=auto(limited), 2=force
     "playback": {"loop": True},
-    "log": {"send_ms": False},
-    "net": {"win_timer_res": True}
+    "log": {"send_ms": False, "rate_ms": 1000, "detail": False, "metrics": True},
+    "net": {"win_timer_res": True, "spread_packets": True, "spread_max_fps": 120, "spread_min_ms": 3.0}
 }
 
 # -------------------------
@@ -133,25 +154,19 @@ def _truthy(s: str) -> bool:
     return s.lower() not in ("0", "false", "no", "off", "")
 
 
-async def _ws_send(ws, obj) -> bool:
-    """Best-effort JSON send; returns False if the socket is already closed.
-    Keeps error handling consistent and avoids raising into the control loop on disconnects.
-    """
+def _ffmpeg_exe_path() -> Optional[str]:
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
     try:
-        await ws.send(json.dumps(obj, separators=(",", ":")))
-        return True
-    except (ConnectionClosed, OSError):
-        return False
-
-
-def _require_fields(msg, fields, verb):
-    missing = [f for f in fields if f not in msg]
-    if missing:
-        raise ValueError(f"{verb} requires {', '.join(fields)} (missing: {', '.join(missing)})")
+        import imageio_ffmpeg  # type: ignore
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
 
 
 def _ffmpeg_has_hwaccel(name: str) -> bool:
-    exe = shutil.which("ffmpeg")
+    exe = _ffmpeg_exe_path()
     if not exe:
         return False
     try:
@@ -165,22 +180,23 @@ def pick_hw_backend(prefer: str | None = None) -> tuple[Optional[str], dict]:
     sys = platform.system().lower()
     prefer = (prefer or "auto").lower()
 
+    ALIASES = {"d3d11": "d3d11va", "gpu": "cuda"}
     def ok(n): return _ffmpeg_has_hwaccel(n)
+    def norm(n): return ALIASES.get(n, n)
 
     if prefer not in ("", "auto", "none"):
-        return (prefer if ok(prefer) else None, {})
+        pn = norm(prefer)
+        return (pn if ok(pn) else None, {})
 
     if sys == "windows":
-        if ok("cuda"): return "cuda", {}
-        if ok("d3d11va"): return "d3d11va", {}
-        if ok("qsv"): return "qsv", {}
+        for cand in ("cuda", "d3d11va", "qsv"):
+            if ok(cand): return cand, {}
         return None, {}
     if sys == "darwin":
         if ok("videotoolbox"): return "videotoolbox", {}
         return None, {}
-    if ok("vaapi"): return "vaapi", {"device": "/dev/dri/renderD128"}
-    if ok("qsv"): return "qsv", {}
-    if ok("cuda"): return "cuda", {}
+    for cand in ("vaapi", "qsv", "cuda"):
+        if ok(cand): return cand, {}
     return None, {}
 
 
@@ -202,16 +218,6 @@ def _resize_pad_to_rgb_bytes(img: Image.Image, size: Tuple[int, int]) -> bytes:
         canvas.paste(im, ((w - im.size[0]) // 2, (h - im.size[1]) // 2))
         im = canvas
     return np.asarray(im, dtype=np.uint8).tobytes()
-
-
-def _apply_rotation_rgb_array(arr: np.ndarray, rotate_deg: int) -> np.ndarray:
-    if rotate_deg % 360 == 0:
-        return arr
-    k = (rotate_deg // 90) % 4
-    if k == 1: return np.rot90(arr, 1)
-    if k == 2: return np.rot90(arr, 2)
-    if k == 3: return np.rot90(arr, 3)
-    return arr
 
 
 def _rotation_from_stream_and_frame(vstream, frame) -> int:
@@ -237,16 +243,12 @@ def _rotation_from_stream_and_frame(vstream, frame) -> int:
 # -------------------------
 
 def _iter_frames_imageio(srcu: str, size: Tuple[int, int], loop_video: bool):
-    """Image/still/animated-GIF path using imageio.
-    We try to infer native frame delay from container if present; otherwise
-    we derive it from FPS (if available) with a floor of MIN_DELAY_MS.
-    """
-    default_delay_ms = 100
+    default_delay_ms = 1000.0 / 10.0
     try:
         props = iio.improps(srcu)
         fps = getattr(props, "fps", None)
         if fps and fps > 0:
-            default_delay_ms = max(MIN_DELAY_MS, int(round(1000.0 / float(fps))))
+            default_delay_ms = max(MIN_DELAY_MS, 1000.0 / float(fps))
     except Exception:
         pass
 
@@ -265,10 +267,11 @@ def _iter_frames_imageio(srcu: str, size: Tuple[int, int], loop_video: bool):
                     if hasattr(frame, "meta"):
                         d = frame.meta.get("duration")
                         if d is not None:
-                            delay_ms = int(d * 1000) if isinstance(d, float) else int(d)
+                            if isinstance(d, (int, float)):
+                                delay_ms = float(d) * (1000.0 if float(d) <= 10.0 else 1.0)
                 except Exception:
                     pass
-                yield rgb888, max(MIN_DELAY_MS, delay_ms)
+                yield rgb888, max(MIN_DELAY_MS, float(delay_ms))
             if not loop_video:
                 break
             if not saw:
@@ -283,47 +286,115 @@ def _iter_frames_imageio(srcu: str, size: Tuple[int, int], loop_video: bool):
 
 
 def _open_with_hwaccel(srcu: str, prefer: str | None):
-    if not _HAVE_PYAV:
-        return av.open(srcu, mode="r"), None, None  # type: ignore
-    kind, kw = pick_hw_backend(prefer)
-    container = av.open(srcu, mode="r")
-    vstream = next((s for s in container.streams if s.type == "video"), None)
-    if vstream is None:
-        raise RuntimeError("no video stream")
-    if not kind:
-        return container, vstream, None
+    kind, _kw = pick_hw_backend(prefer)
     try:
-        hw = av.hwdevice.Context.create(kind, kw.get("device", None)) if kw else av.hwdevice.Context.create(kind)
-        dec = av.codec.CodecContext.create(vstream.codec.name, "r")
-        dec.options = vstream.codec_context.options
-        dec.hw_device_ctx = hw
-        return container, vstream, dec
+        if kind:
+            try:
+                from av.codec.hwaccel import HWAccel
+            except Exception as ie:
+                raise RuntimeError(f"hwaccel API unavailable: {ie}")
+            container = av.open(srcu, mode="r", hwaccel=HWAccel(device_type=kind))
+            print(f"[hw] selected {kind} for decode")
+        else:
+            print("[hw] using CPU decode (no HW accel selected)")
+            container = av.open(srcu, mode="r")
+        vstream = next((s for s in container.streams if s.type == "video"), None)
+        if vstream is None:
+            raise RuntimeError("no video stream")
+        return container, vstream, None
     except Exception as e:
-        print(f"[hwaccel disabled: {kind} not available: {e}]")
+        print(f"[hwaccel disabled: {kind or 'auto'} not available: {e}]")
+        container = av.open(srcu, mode="r")
+        vstream = next((s for s in container.streams if s.type == "video"), None)
+        if vstream is None:
+            raise RuntimeError("no video stream")
         return container, vstream, None
 
 
 def _iter_frames_pyav(srcu: str, size: Tuple[int, int], loop_video: bool,
                       *, expand_mode: int, hw_prefer: str | None):
-    """Video path using PyAV.
-    - Limited-range expansion (MPEG) maps 16..235 -> 0..255 when enabled (auto/force).
-    - Rotation metadata is honored before scaling.
-    - Inter-frame delay is derived from PTS deltas when available; otherwise from average_rate.
-    """
+    TW, TH = size
+
+    def _tb_num_den(tb) -> Tuple[int, int]:
+        if tb is None:
+            return (1, 1000)
+        n = getattr(tb, "num", None); d = getattr(tb, "den", None)
+        if n is not None and d is not None:
+            return int(n), int(d)
+        n = getattr(tb, "numerator", None); d = getattr(tb, "denominator", None)
+        if n is not None and d is not None:
+            return int(n), int(d)
+        try:
+            n, d = tb
+            return int(n), int(d)
+        except Exception:
+            return (1, 1000)
+
+    try:
+        from av.error import BlockingIOError as AvBlockingIOError  # type: ignore
+    except Exception:
+        AvBlockingIOError = None  # type: ignore
+
     while True:
         try:
             container, vstream, dec = _open_with_hwaccel(srcu, hw_prefer)
             if vstream is None:
                 raise RuntimeError("no video stream")
 
-            avg_ms = None
+            avg_ms: Optional[float] = None
             if vstream.average_rate:
                 try:
                     fps = float(vstream.average_rate)
                     if fps > 0:
-                        avg_ms = max(MIN_DELAY_MS, int(round(1000.0 / fps)))
+                        avg_ms = max(MIN_DELAY_MS, 1000.0 / fps)
                 except Exception:
                     pass
+
+            graph = None
+            src_in = sink_out = None
+
+            def _ensure_graph_for(frame) -> None:
+                nonlocal graph, src_in, sink_out
+                if graph is not None:
+                    return
+
+                g = AvFilterGraph()
+
+                tb_n, tb_d = _tb_num_den(frame.time_base or vstream.time_base)
+                src = g.add(
+                    "buffer",
+                    args=(
+                        f"video_size={frame.width}x{frame.height}:"
+                        f"pix_fmt=rgb24:"
+                        f"time_base={tb_n}/{tb_d}:"
+                        f"pixel_aspect=1/1"
+                    ),
+                )
+                last = src
+
+                rot = _rotation_from_stream_and_frame(vstream, frame)
+                if rot in (90, 180, 270):
+                    if rot == 90:
+                        t = g.add("transpose", args="clock"); last.link_to(t); last = t
+                    elif rot == 270:
+                        t = g.add("transpose", args="cclock"); last.link_to(t); last = t
+                    else:  # 180
+                        t1 = g.add("transpose", args="clock")
+                        t2 = g.add("transpose", args="clock")
+                        last.link_to(t1); t1.link_to(t2); last = t2
+
+                sc = g.add("scale", args=f"{TW}:{TH}:flags=bilinear:force_original_aspect_ratio=decrease")
+                last.link_to(sc); last = sc
+                pd = g.add("pad", args=f"{TW}:{TH}:(ow-iw)/2:(oh-ih)/2:color=black")
+                last.link_to(pd); last = pd
+
+                sink = g.add("buffersink")
+                last.link_to(sink)
+                g.configure()
+
+                graph = g
+                src_in = src
+                sink_out = sink
 
             last_pts_s: Optional[float] = None
 
@@ -332,7 +403,6 @@ def _iter_frames_pyav(srcu: str, size: Tuple[int, int], loop_video: bool,
                 for frame in frames:
                     arr = frame.to_ndarray(format="rgb24")
 
-                    # limited-range expand?
                     do_expand = (expand_mode == 2)
                     if expand_mode == 1:
                         rng = getattr(frame, "color_range", None)
@@ -343,156 +413,180 @@ def _iter_frames_pyav(srcu: str, size: Tuple[int, int], loop_video: bool,
                         do_expand = bool(rng_name and "mpeg" in str(rng_name).lower())
                     if do_expand:
                         arr = np.clip((arr.astype(np.int16) - 16) * 255 // 219, 0, 255).astype(np.uint8)
-                    else:
-                        if arr.dtype != np.uint8:
-                            arr = arr.astype(np.uint8)
+                    elif arr.dtype is not np.uint8:
+                        arr = arr.astype(np.uint8)
 
-                    # rotation
-                    rotate_deg = _rotation_from_stream_and_frame(vstream, frame)
-                    if rotate_deg:
-                        arr = _apply_rotation_rgb_array(arr, rotate_deg)
+                    f_rgb = av.VideoFrame.from_ndarray(arr, format="rgb24")
+                    if getattr(f_rgb, "time_base", None) is None and getattr(vstream, "time_base", None):
+                        f_rgb.time_base = vstream.time_base
+                    _ensure_graph_for(f_rgb)
+                    src_in.push(f_rgb)  # type: ignore[name-defined]
 
-                    im = Image.fromarray(arr).convert("RGB")
-                    rgb888 = _resize_pad_to_rgb_bytes(im, size)
+                    out_frames = []
+                    while True:
+                        try:
+                            of = sink_out.pull()  # type: ignore[name-defined]
+                            out_frames.append(of)
+                        except Exception as pe:
+                            if (AvBlockingIOError and isinstance(pe, AvBlockingIOError)) \
+                               or getattr(pe, "errno", None) in (11, 35) \
+                               or "resource temporarily unavailable" in str(pe).lower() \
+                               or "eagain" in str(pe).lower():
+                                break
+                            raise
 
-                    delay_ms = avg_ms if avg_ms is not None else 100
-                    pts_s = None
-                    if frame.pts is not None:
-                        tb = frame.time_base or vstream.time_base
-                        if tb is not None:
-                            pts_s = float(frame.pts * tb)
-                    if pts_s is not None:
-                        if last_pts_s is None:
-                            delay_ms = avg_ms if avg_ms is not None else 33
-                        else:
-                            delta_ms = int(round((pts_s - last_pts_s) * 1000.0))
-                            if delta_ms <= 0 and avg_ms is not None:
-                                delta_ms = avg_ms
-                            delay_ms = max(MIN_DELAY_MS, delta_ms)
-                        last_pts_s = pts_s
+                    for of in out_frames:
+                        rgb888 = of.to_ndarray(format="rgb24").tobytes()
 
-                    yield rgb888, delay_ms
+                        delay_ms: float = float(avg_ms) if (avg_ms is not None) else 1000.0 / 10.0
+                        pts_s = None
+                        if of.pts is not None:
+                            tb_n, tb_d = _tb_num_den(of.time_base or vstream.time_base)
+                            pts_s = float(of.pts) * (tb_n / tb_d)
+                        if pts_s is not None:
+                            if last_pts_s is None:
+                                delay_ms = float(avg_ms) if (avg_ms is not None) else 33.33
+                            else:
+                                delta_ms = (pts_s - last_pts_s) * 1000.0
+                                if delta_ms <= 0 and (avg_ms is not None):
+                                    delta_ms = float(avg_ms)
+                                delay_ms = max(MIN_DELAY_MS, float(delta_ms))
+                            last_pts_s = pts_s
+
+                        yield rgb888, float(delay_ms)
 
             container.close()
             if not loop_video:
                 break
+
         except Exception as e:
             msg = str(e).lower()
             if isinstance(e, FileNotFoundError) or "no such file" in msg or "not found" in msg:
                 raise FileNotFoundError(f"cannot open source: {srcu}") from e
             raise RuntimeError(f"av error: {e}") from e
+
         if not loop_video:
             break
 
 
 def iter_frames(src: str, size: Tuple[int, int], loop_video: bool = True,
                 *, expand_mode: int, hw_prefer: str | None):
-    """Choose PyAV for videos, imageio for images/GIFs."""
     srcu = unquote(src)
     low = srcu.lower()
-    if _HAVE_PYAV and not any(low.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif")):
+    if not any(low.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif")):
         yield from _iter_frames_pyav(srcu, size, loop_video, expand_mode=expand_mode, hw_prefer=hw_prefer)
     else:
         yield from _iter_frames_imageio(srcu, size, loop_video)
 
 
 # -------------------------
-# DDP sender (optimized)
+# DDP packetizer
 # -------------------------
 
-_DDP_MAX_DATA = 1440                                  # payload bytes per packet
-_DDP_HDR = struct.Struct("!BBB B I H")                # 10-byte header
-_DDP_PIXEL_CFG_RGB888 = 0x2C                          # RGB 8bpc
+_DDP_MAX_DATA = 1440
+_DDP_HDR = struct.Struct("!BBB B I H")
+_DDP_PIXEL_CFG_RGB888 = 0x2C
 
-
-def ddp_send_frame(sock, addr, rgb_bytes: bytes, output_id: int, seq: int):
-    """Chunk a full RGB888 frame into DDP packets using a single reusable buffer.
-
-    Header layout (network byte order):
-      flags (1): bit6=DDP, bit0=PUSH (set on last packet)
-      seq   (1): 0..255 (we wrap 0..15 higher up to match DDP's 4-bit habit)
-      pix   (1): 0x2C (RGB, 8bpc)
-      out   (1): output id (0..255)
-      off   (4): byte offset in full frame
-      len   (2): data bytes in this packet (<= 1440)
-    """
+def _ddp_iter_packets(rgb_bytes: bytes, output_id: int, seq: int):
     mv = memoryview(rgb_bytes)
     total = len(mv)
     off = 0
     push_mask = 0x01
-    ddp_base_flags = 0x40  # DDP
-
-    # One small buffer to build each packet: header(10) + payload(<=1440)
-    pkt = bytearray(_DDP_HDR.size + _DDP_MAX_DATA)
-
+    ddp_base_flags = 0x40
     while off < total:
-        chunk = mv[off: off + _DDP_MAX_DATA]
-        is_last = (off + len(chunk) >= total)
+        end = min(off + _DDP_MAX_DATA, total)
+        chunk = mv[off:end]
+        is_last = end >= total
         flags = ddp_base_flags | (push_mask if is_last else 0)
-
+        payload_len = len(chunk)
+        pkt = bytearray(_DDP_HDR.size + payload_len)
         _DDP_HDR.pack_into(pkt, 0,
             flags,
             seq & 0xFF,
             _DDP_PIXEL_CFG_RGB888,
             output_id & 0xFF,
             off,
-            len(chunk)
+            payload_len
         )
-        pkt[_DDP_HDR.size : _DDP_HDR.size + len(chunk)] = chunk
+        pkt[_DDP_HDR.size:] = chunk.tobytes()
+        yield bytes(pkt)
+        off = end
 
-        sock.sendto(pkt[:_DDP_HDR.size + len(chunk)], addr)
-        off += len(chunk)
+
+# -------------------------
+# Async UDP transport
+# -------------------------
+
+class _UDPSender(asyncio.DatagramProtocol):
+    def __init__(self):
+        self.transport: asyncio.DatagramTransport | None = None
+        self.packets_sent = 0
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = transport
+
+    def error_received(self, exc: BaseException) -> None:
+        print(f"[udp] error_received: {exc!r}")
+
+    def connection_lost(self, exc: BaseException | None) -> None:
+        if exc:
+            print(f"[udp] connection_lost: {exc!r}")
+
+    def sendto(self, data: bytes, addr):
+        if self.transport is not None:
+            self.transport.sendto(data, addr)
+            self.packets_sent += 1
 
 
 # -------------------------
 # Paced sender (upsample)
 # -------------------------
-async def _paced_sender(sock, addr, output_id, *, pace_hz, ema_alpha, get_latest_bytes):
-    """Send at fixed rate, using latest bytes supplier. Returns when cancelled.
-    EMA is computed in float32 to avoid repeated dtype churn; we cast to uint8 only on transmit.
-    """
-    loop_ = asyncio.get_running_loop()
-    next_tick = loop_.time()
-    seq = 0
+
+async def _paced_sender(loop, q, *, pace_hz, ema_alpha, get_latest_bytes, out_id, proto):
+    next_t = loop.time()
     tick_s = 1.0 / pace_hz
-    ema_buf: Optional[np.ndarray] = None  # float32 accumulator
+    ema_buf: Optional[np.ndarray] = None
+    seq = 0
 
     while True:
-        latest = get_latest_bytes()
-        if latest is not None:
+        buf = get_latest_bytes()
+        if buf is not None:
             if ema_alpha > 0.0:
-                cur = np.frombuffer(latest, dtype=np.uint8)
+                cur = np.frombuffer(buf, dtype=np.uint8)
                 if ema_buf is None or ema_buf.shape != cur.shape:
                     ema_buf = cur.astype(np.float32, copy=True)
                 else:
-                    # ema_buf = ema_buf*(1-a) + cur*a
                     ema_buf *= (1.0 - ema_alpha)
                     ema_buf += cur.astype(np.float32) * ema_alpha
-                payload = ema_buf.astype(np.uint8, copy=False).tobytes()
+                outb = ema_buf.astype(np.uint8, copy=False).tobytes()
             else:
-                payload = latest
+                outb = buf
 
-            ddp_send_frame(sock, addr, payload, output_id, seq)
+            for pkt in _ddp_iter_packets(outb, out_id, seq):
+                if q.full():
+                    try:
+                        q.get_nowait(); q.task_done()
+                    except asyncio.QueueEmpty:
+                        pass
+                await q.put(pkt)
             seq = (seq + 1) & 0x0F
 
-        next_tick += tick_s
-        sleep_for = max(0.0, next_tick - loop_.time())
-        if sleep_for > 0:
-            await asyncio.sleep(sleep_for)
+        await asyncio.sleep(max(0.0, next_t - loop.time()))
+        next_t += tick_s
 
 
 # -------------------------
-# Main task per connection
+# Main task per connection (CORRECTED)
 # -------------------------
+
 async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, opts):
-    """If pace_hz>0: run producer (native cadence) + paced sender (fixed Hz).
-       Else: single native-cadence loop (what worked for you).
-
-       Note: src path validation happens in start_stream(); we avoid repeating it here.
+    """If pace_hz>0: producer (native) + paced sender. Else: native-cadence push.
+       Non-blocking UDP with bounded queue. Optional per-frame packet spreading.
     """
-    import socket
-    w, h = size
+    import socket, time
+    from collections import deque
 
+    w, h = size
     frames = iter_frames(
         src, (w, h),
         loop_video=opts["loop"],
@@ -500,56 +594,247 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
         hw_prefer=opts["hw"]
     )
 
+    loop = asyncio.get_running_loop()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     addr = (target_ip, target_port)
 
-    pace_hz   = int(opts.get("pace_hz", 0))
-    ema_alpha = float(opts.get("ema_alpha", 0.0))
+    # Config
+    log_cfg = CONFIG.get("log", {})
+    log_metrics = bool(log_cfg.get("metrics", True))
+    log_detail  = bool(log_cfg.get("detail", False))
+    log_rate_ms = int(log_cfg.get("rate_ms", 1000))
+    spread_enabled = bool(CONFIG.get("net", {}).get("spread_packets", False))
+    spread_max_fps = int(CONFIG.get("net", {}).get("spread_max_fps", 120))
 
+    # Meters
+    pkt_meter = _RateMeter()
+    frm_meter = _RateMeter()
+    q_occ_samples = deque(maxlen=200)
+    q_drops = 0
+
+    transport = None
     try:
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
+        except OSError:
+            pass
+
+        sock.bind(("0.0.0.0", 0))
+
+        proto = _UDPSender()
+        transport, _ = await loop.create_datagram_endpoint(lambda: proto, sock=sock)
+
+        max_in_flight = 4096
+        q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=max_in_flight)
+
+        async def drainer():
+            while True:
+                pkt = await q.get()
+                try:
+                    proto.sendto(pkt, addr)
+                    if log_metrics:
+                        pkt_meter.tick(time.perf_counter())
+                finally:
+                    q.task_done()
+
+        drain_task = asyncio.create_task(drainer())
+
+        pace_hz   = int(opts.get("pace_hz", 0))
+        ema_alpha = float(opts.get("ema_alpha", 0.0))
+
+        frames_emitted = 0
+        packets_enqueued = 0
+        last_log = time.perf_counter()
+        seq = 0
+
+        async def enqueue_frame(rgb888: bytes, seq_val: int,
+                                *, packet_spacing_s: Optional[float] = None,
+                                group_n: int = 1):
+            nonlocal packets_enqueued, q_drops
+            total_len = len(rgb888)
+            off = 0
+            slot_idx = 0
+            start_ts = loop.time() if (packet_spacing_s and packet_spacing_s > 0.0) else None
+            while off < total_len:
+                # group_n packets per timeslot (to avoid micro-sleeps)
+                group_left = group_n if group_n > 0 else 1
+                end = min(off + _DDP_MAX_DATA, total_len)
+                chunk = rgb888[off:end]
+                is_last = end >= total_len
+                flags = 0x40 | (0x01 if is_last else 0)
+                pkt = bytearray(_DDP_HDR.size + len(chunk))
+                _DDP_HDR.pack_into(pkt, 0,
+                    flags, seq_val & 0xFF, _DDP_PIXEL_CFG_RGB888, out_id & 0xFF, off, len(chunk)
+                )
+                pkt[_DDP_HDR.size:] = chunk
+
+                # enqueue immediately; we'll sleep after sending 'group_n' packets
+                if q.full():
+                    try:
+                        q.get_nowait(); q.task_done(); q_drops += 1
+                    except asyncio.QueueEmpty:
+                        pass
+                await q.put(bytes(pkt))
+                packets_enqueued += 1
+                group_left -= 1
+                off = end
+                # If we've sent a group and spacing is configured, sleep until next slot
+                if group_left <= 0 and start_ts is not None and packet_spacing_s and packet_spacing_s > 0.0:
+                    slot_idx += 1
+                    target = start_ts + slot_idx * packet_spacing_s
+                    await asyncio.sleep(max(0.0, target - loop.time()))
+                    group_left = group_n if group_n > 0 else 1
+
         if pace_hz > 0:
-            # ---- paced mode: producer + sender ----
+            # Pacing path
             latest: Dict[str, Optional[bytes]] = {"buf": None}
             latest_lock = asyncio.Lock()
 
             async def producer():
-                # Honor native cadence by sleeping per frame delay_ms
+                nonlocal frames_emitted, last_log, seq
                 for rgb888, delay_ms in frames:
                     async with latest_lock:
                         latest["buf"] = rgb888
-                    await asyncio.sleep(max(1, int(delay_ms)) / 1000.0)
+                    frames_emitted += 1
+                    if log_metrics:
+                        frm_meter.tick(time.perf_counter())
+                    seq = (seq + 1) & 0x0F
 
-            def get_latest_bytes():
-                # lockless read; bytes assignment is atomic enough for CPython
-                return latest["buf"]
+                    now = time.perf_counter()
+                    if now - last_log >= (log_rate_ms / 1000.0):
+                        if log_metrics:
+                            fps = frm_meter.rate_hz()
+                            pps = pkt_meter.rate_hz()
+                            pkt_jit = pkt_meter.jitter_ms()
+                            frm_jit = frm_meter.jitter_ms()
+                            q_avg = (sum(q_occ_samples)/len(q_occ_samples)) if q_occ_samples else 0
+                            q_max = max(q_occ_samples) if q_occ_samples else 0
+                            spread_tag = (" (spread)" if (spread_enabled and pace_hz <= spread_max_fps) else "")
+                            print(f"[send] out={out_id} pace={pace_hz}Hz fps={fps:.2f} pps={pps:.0f} "
+                                  f"pkt_jit={pkt_jit:.1f}ms frm_jit={frm_jit:.1f}ms "
+                                  f"q_avg={q_avg:.0f}/{max_in_flight} q_max={q_max} "
+                                  f"enq={packets_enqueued} tx={proto.packets_sent} drops={q_drops}{spread_tag}")
+                        else:
+                            print(f"[send] out={out_id} pace={pace_hz}Hz frames={frames_emitted} enq={packets_enqueued} tx={proto.packets_sent}")
+                        frames_emitted = 0
+                        q_occ_samples.clear()
+                        last_log = now
 
-            sender_task = asyncio.create_task(
-                _paced_sender(sock, addr, out_id,
-                              pace_hz=pace_hz, ema_alpha=max(0.0, min(ema_alpha, 1.0)),
-                              get_latest_bytes=get_latest_bytes)
-            )
+                    await asyncio.sleep(max(MIN_DELAY_MS/1000.0, float(delay_ms)/1000.0))
+
+            async def sampler():
+                tick = 1.0 / pace_hz
+                next_t = loop.time()
+                while True:
+                    buf = latest["buf"]
+                    if buf is not None:
+                        if spread_enabled and pace_hz <= spread_max_fps:
+                            pkt_count = (len(buf) + _DDP_MAX_DATA - 1) // _DDP_MAX_DATA
+                            spacing = (tick / pkt_count) if pkt_count > 0 else None
+                            if spacing and spacing > 0.0:
+                                min_s = float(CONFIG.get('net', {}).get('spread_min_ms', 3.0)) / 1000.0
+                                import math
+                                group_n = max(1, int(math.ceil(min_s / spacing)))
+                                spacing = spacing * group_n
+                            else:
+                                group_n = 1
+                        else:
+                            spacing = None
+                            group_n = 1
+                        await enqueue_frame(buf, seq, packet_spacing_s=spacing, group_n=group_n)
+
+                    if log_metrics:
+                        q_occ_samples.append(q.qsize())
+
+                    await asyncio.sleep(max(0.0, next_t - loop.time()))
+                    next_t += tick
+
+            prod_task = asyncio.create_task(producer())
+            pace_task = asyncio.create_task(sampler())
             try:
-                await producer()  # returns when source ends (or loops forever)
+                await prod_task
             finally:
-                sender_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await sender_task
+                pace_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await pace_task
 
         else:
-            # ---- native mode: send once per source frame ----
-            loop_ = asyncio.get_running_loop()
-            next_deadline = loop_.time()
-            seq = 0
+            # Native cadence
+            last_log = time.perf_counter()
+            next_t = loop.time()
             for rgb888, delay_ms in frames:
-                ddp_send_frame(sock, addr, rgb888, out_id, seq)
-                next_deadline += max(1, int(delay_ms)) / 1000.0
-                sleep_for = max(0.0, next_deadline - loop_.time())
-                if sleep_for > 0:
-                    await asyncio.sleep(sleep_for)
-                seq = (seq + 1) & 0x0F
+                delay_s = max(MIN_DELAY_MS/1000.0, float(delay_ms)/1000.0)
 
+                if spread_enabled:
+                    inst_fps = (1.0/delay_s) if delay_s > 0 else 1e9
+                    if inst_fps <= spread_max_fps:
+                        pkt_count = (len(rgb888) + _DDP_MAX_DATA - 1) // _DDP_MAX_DATA
+                        spacing = (delay_s / pkt_count) if pkt_count > 0 else None
+                        if spacing and spacing > 0.0:
+                            min_s = float(CONFIG.get('net', {}).get('spread_min_ms', 3.0)) / 1000.0
+                            import math
+                            group_n = max(1, int(math.ceil(min_s / spacing)))
+                            spacing = spacing * group_n
+                        else:
+                            group_n = 1
+                    else:
+                        spacing = None
+                        group_n = 1
+                else:
+                    spacing = None
+                    group_n = 1
+
+                await enqueue_frame(rgb888, seq, packet_spacing_s=spacing, group_n=group_n)
+                seq = (seq + 1) & 0x0F
+                frames_emitted += 1
+
+                if log_metrics:
+                    frm_meter.tick(time.perf_counter())
+                    q_occ_samples.append(q.qsize())
+
+                now = time.perf_counter()
+                if now - last_log >= (log_rate_ms / 1000.0):
+                    if log_metrics:
+                        fps = frm_meter.rate_hz()
+                        pps = pkt_meter.rate_hz()
+                        pkt_jit = pkt_meter.jitter_ms()
+                        frm_jit = frm_meter.jitter_ms()
+                        q_avg = (sum(q_occ_samples)/len(q_occ_samples)) if q_occ_samples else 0
+                        q_max = max(q_occ_samples) if q_occ_samples else 0
+                        target = 1000.0 / max(float(delay_ms), 1.0)
+                        spread_tag = (" (spread)" if spacing else "")
+                        print(f"[send] out={out_id} native fps={fps:.2f} (~{target:.1f} tgt) pps={pps:.0f} "
+                              f"pkt_jit={pkt_jit:.1f}ms frm_jit={frm_jit:.1f}ms "
+                              f"q_avg={q_avg:.0f}/{max_in_flight} q_max={q_max} "
+                              f"enq={packets_enqueued} tx={proto.packets_sent} drops={q_drops}{spread_tag}")
+                    else:
+                        print(f"[send] out={out_id} native frames={frames_emitted} enq={packets_enqueued} tx={proto.packets_sent}")
+                    frames_emitted = 0
+                    q_occ_samples.clear()
+                    last_log = now
+
+                next_t += delay_s
+                await asyncio.sleep(max(0.0, next_t - loop.time()))
+
+        await q.join()
+        drain_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await drain_task
+
+    except Exception as e:
+        print(f"[send] out={out_id} fatal error: {e!r}")
+        traceback.print_exc()
+        raise
     finally:
-        sock.close()
+        try:
+            if transport is not None:
+                transport.close()
+        except Exception:
+            pass
+        try:
+            sock.close()
+        except Exception:
+            pass
 
 
 # =========================
@@ -559,13 +844,10 @@ CONFIG: Dict[str, Any] = DEFAULT_CONFIG
 
 
 def _is_benign_disconnect(exc: BaseException) -> bool:
-    # Windows common transient network errors
     if isinstance(exc, OSError) and getattr(exc, "winerror", None) in (64, 121):
         return True
     return isinstance(exc, (ConnectionClosedOK, ConnectionClosedError))
 
-
-# Small parse helpers for readability
 
 def _parse_expand(val, default):
     s = str(val if val is not None else default).lower()
@@ -590,24 +872,6 @@ def _parse_pace_hz(v):
 
 
 async def handle_control(ws):
-    """
-    New protocol (message-based on a single WS):
-      -> hello { proto:"ddp-ws/1", device_id?, caps? }
-      <- hello_ack { server_version }
-
-      -> start_stream { out,w,h,src, ddp_port?, pace?, ema?, expand?, loop?, hw? }
-      <- ack { out, applied:{...} }
-
-      -> update { out, src?, pace?, ema?, expand?, loop?, hw? }
-      <- ack { out, applied:{...} }
-
-      -> stop_stream { out }
-      <- ack { out }
-
-      -> ping { t }
-      <- pong { t }
-    """
-    # one connection = one session; can host multiple outputs
     streams: dict[int, asyncio.Task] = {}
     streams_lock = asyncio.Lock()
     session = {
@@ -634,14 +898,12 @@ async def handle_control(ws):
             "ema_alpha": max(0.0, min(float(msg.get("ema", 0.0)), 1.0)),
         }
 
-        # Validate local file early if file:// or path
         srcu = unquote(src)
         local_path = _resolve_local_path(srcu)
         if local_path is not None and not os.path.exists(local_path):
             print(f"* start_stream {session['ip']} dev={session['device_id']} out={out} requested missing file: {local_path}")
             raise FileNotFoundError(f"no such file: {local_path}")
 
-        # stop any existing task for this out (serialized)
         async with streams_lock:
             t_old = streams.pop(out, None)
             if t_old:
@@ -649,11 +911,23 @@ async def handle_control(ws):
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await t_old
 
-        log = print  # simple logging style consistent with your file
-        log(f"* start_stream {session['ip']} dev={session['device_id']} out={out} size={w}x{h} ddp_port={ddp_port} "
-            f"src={src} pace={opts['pace_hz']} ema={opts['ema_alpha']} expand={opts['expand_mode']} loop={opts['loop']} hw={opts['hw']}")
+        print(f"* start_stream {session['ip']} dev={session['device_id']} out={out} size={w}x{h} ddp_port={ddp_port} "
+              f"src={src} pace={opts['pace_hz']} ema={opts['ema_alpha']} expand={opts['expand_mode']} loop={opts['loop']} hw={opts['hw']}")
 
         task = asyncio.create_task(ddp_task(session["ip"], ddp_port, out, size=(w, h), src=src, opts=opts))
+
+        def _on_done(t: asyncio.Task):
+            try:
+                exc = t.exception()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                print(f"[task] out={out} exception(): {e!r}")
+                return
+            if exc:
+                print(f"[task] out={out} crashed: {exc!r}")
+        task.add_done_callback(_on_done)
+
         async with streams_lock:
             streams[out] = task
 
@@ -675,14 +949,12 @@ async def handle_control(ws):
         await _ws_send(ws, {"type": "ack", "out": out})
 
     async def update_stream(msg):
-        # apply deltas by reissuing start_stream with prior args (simple)
         _require_fields(msg, ("out",), "update")
         out = int(msg["out"])
         async with streams_lock:
             if out not in streams:
                 raise ValueError(f"update for unknown out={out} (no active stream)")
 
-        # Gather fields to forward to start_stream; if size/port unchanged, client may omit them.
         base = {"type": "start_stream", "out": out}
         applied = {}
         for k in ("w","h","ddp_port","src","pace","ema","expand","loop","hw"):
@@ -695,7 +967,7 @@ async def handle_control(ws):
 
         await _ws_send(ws, {"type": "ack", "out": out, "applied": applied})
 
-    # --- handshake: first message must be hello ---
+    # --- handshake ---
     try:
         raw = await ws.recv()
         hello = json.loads(raw)
@@ -717,7 +989,6 @@ async def handle_control(ws):
     print(f"* hello from {session['ip']} dev={session['device_id']} proto={hello.get('proto')}")
     await _ws_send(ws, {"type":"hello_ack","server_version":"lvgl-ddp-stream/1"})
 
-    # main loop
     try:
         async for raw in ws:
             try:
@@ -738,14 +1009,12 @@ async def handle_control(ws):
             except Exception as e:
                 await _ws_send(ws, {"type":"error","code":"server_error","message":str(e)})
     except Exception as loop_exc:
-        # Downgrade common disconnects; keep concise.
         if _is_benign_disconnect(loop_exc):
             reason = getattr(loop_exc, 'reason', '') or (getattr(loop_exc, 'args', [''])[0])
             print(f"* disconnect {session['ip']} ({type(loop_exc).__name__}: {reason})")
         else:
             print(f"[warn] control loop error from {session['ip']}: {loop_exc!r}")
     finally:
-        # teardown all outputs on disconnect
         async with streams_lock:
             for out, t in list(streams.items()):
                 t.cancel()
@@ -762,7 +1031,6 @@ async def dispatch(ws):
         else:
             await ws.close(code=4003, reason="unknown path")
     except Exception as e:
-        # Prevent server-level tracebacks for normal disconnects
         if not _is_benign_disconnect(e):
             print(f"[warn] connection handler error: {e!r}")
         with contextlib.suppress(Exception):
@@ -797,7 +1065,7 @@ async def main():
         if bool(CONFIG["net"].get("win_timer_res", True)):
             _win_timer_res(True)
 
-        print("* ws_ddp_proxy on ws://{}:{}/control  (protocol: hello, start_stream, update, stop_stream, ping/pong)".format(args.host, args.port))
+        print("* ws_ddp_proxy on ws://{}:{}/control".format(args.host, args.port))
         async with websockets.serve(
             dispatch, args.host, args.port,
             max_size=2**22,
@@ -809,6 +1077,24 @@ async def main():
     finally:
         if bool(CONFIG["net"].get("win_timer_res", True)):
             _win_timer_res(False)
+
+
+# -------------------------
+# Small shared helpers
+# -------------------------
+
+async def _ws_send(ws, obj) -> bool:
+    try:
+        await ws.send(json.dumps(obj, separators=(",", ":")))
+        return True
+    except (ConnectionClosed, OSError):
+        return False
+
+
+def _require_fields(msg, fields, verb):
+    missing = [f for f in fields if f not in msg]
+    if missing:
+        raise ValueError(f"{verb} requires {', '.join(fields)} (missing: {', '.join(missing)})")
 
 
 if __name__ == "__main__":
