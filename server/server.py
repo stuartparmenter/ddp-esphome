@@ -1,9 +1,9 @@
-
 # © Copyright 2025 Stuart Parmenter
 # SPDX-License-Identifier: MIT
 #!/usr/bin/env python3
 
 import asyncio
+import contextlib
 import json
 import os
 import platform
@@ -11,24 +11,26 @@ import shutil
 import struct
 import subprocess
 import time
-import contextlib
 import traceback
+from typing import Optional, Dict, Any
 from urllib.parse import urlparse, unquote
+
 try:
     from urllib.request import url2pathname
-except Exception:
-    def url2pathname(p): return p
-from typing import Tuple, Optional, Dict, Any
+except Exception:  # pragma: no cover
+    def url2pathname(p): return p  # type: ignore[misc]
 
 import numpy as np
-import imageio.v3 as iio
 from PIL import Image, ImageOps
+import imageio.v3 as iio
 import websockets
 from websockets.exceptions import ConnectionClosed, ConnectionClosedOK, ConnectionClosedError
 
+# --- PyAV (video decode + filters) ---
 import av
 from av.filter import Graph as AvFilterGraph
 av.logging.set_level(av.logging.INFO)
+
 
 # -------------------------
 # Metrics helpers
@@ -62,20 +64,70 @@ class _RateMeter:
         n = len(self.ts)
         if n < 3:
             return 0.0
-        diffs = [ (self.ts[i] - self.ts[i-1]) for i in range(1, n) ]
+        diffs = [(self.ts[i] - self.ts[i - 1]) for i in range(1, n)]
         mean = sum(diffs) / len(diffs)
-        var = sum((d - mean)**2 for d in diffs) / (len(diffs) - 1)
+        var = sum((d - mean) ** 2 for d in diffs) / (len(diffs) - 1)
         return math.sqrt(var) * 1000.0
 
-MIN_DELAY_MS = 10.0  # float ms
+
+MIN_DELAY_MS = 10.0  # clamp very small frame delays
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "hw": {"prefer": "auto"},
-    "video": {"expand_mode": 1},  # 0=never, 1=auto(limited), 2=force
+    "video": {"expand_mode": 1},  # 0=never, 1=auto(limited->full), 2=force
     "playback": {"loop": True},
     "log": {"send_ms": False, "rate_ms": 1000, "detail": False, "metrics": True},
-    "net": {"win_timer_res": True, "spread_packets": True, "spread_max_fps": 120, "spread_min_ms": 3.0}
+    "net": {
+        "win_timer_res": True,
+        "spread_packets": True,
+        "spread_max_fps": 60,
+        "spread_min_ms": 3.0,
+        "spread_max_sleeps": 0
+    }
 }
+
+
+def _compute_spacing_and_group(pkt_count: int, frame_interval_s: float) -> tuple[Optional[float], int]:
+    """
+    Compute (spacing_s, group_n) for packet spreading.
+
+    spacing_s: sleep between packet *groups* (None => no spreading)
+    group_n:   number of packets sent per timeslot (then sleep once)
+
+    Enforces:
+      - net.spread_min_ms: minimum spacing to avoid micro-sleeps
+      - net.spread_max_sleeps: maximum sleeps per frame
+
+    Works for both native and paced paths.
+    """
+    import math
+
+    if pkt_count <= 0 or frame_interval_s <= 0.0:
+        return (None, 1)
+
+    net_cfg = CONFIG.get("net", {})
+    min_s = float(net_cfg.get("spread_min_ms", 3.0)) / 1000.0
+    max_sleeps = int(net_cfg.get("spread_max_sleeps", 6))
+
+    # Ideal per-packet spacing if we slept once per packet
+    ideal = frame_interval_s / float(pkt_count)
+
+    # Start by grouping to satisfy minimum spacing
+    group_n = 1
+    if 0.0 < ideal < min_s:
+        group_n = max(1, int(math.ceil(min_s / ideal)))
+
+    # Then cap total sleeps per frame
+    if max_sleeps > 0:
+        per_sleep = max(1, int(math.ceil(pkt_count / max_sleeps)))
+        group_n = max(group_n, per_sleep)
+
+    spacing = ideal * group_n
+    if spacing > frame_interval_s:
+        spacing = frame_interval_s
+
+    return (spacing, group_n)
+
 
 # -------------------------
 # Config helpers
@@ -137,7 +189,7 @@ def load_config(path: Optional[str]) -> Dict[str, Any]:
 
 
 # -------------------------
-# Parsing / small utilities
+# Small utilities
 # -------------------------
 
 def _resolve_local_path(srcu: str) -> Optional[str]:
@@ -176,11 +228,12 @@ def _ffmpeg_has_hwaccel(name: str) -> bool:
         return False
 
 
-def pick_hw_backend(prefer: str | None = None) -> tuple[Optional[str], dict]:
+def pick_hw_backend(prefer: Optional[str] = None):
     sys = platform.system().lower()
     prefer = (prefer or "auto").lower()
 
     ALIASES = {"d3d11": "d3d11va", "gpu": "cuda"}
+
     def ok(n): return _ffmpeg_has_hwaccel(n)
     def norm(n): return ALIASES.get(n, n)
 
@@ -190,21 +243,24 @@ def pick_hw_backend(prefer: str | None = None) -> tuple[Optional[str], dict]:
 
     if sys == "windows":
         for cand in ("cuda", "d3d11va", "qsv"):
-            if ok(cand): return cand, {}
-        return None, {}
+            if ok(cand):
+                return cand, {}
+        return (None, {})
     if sys == "darwin":
-        if ok("videotoolbox"): return "videotoolbox", {}
-        return None, {}
+        if ok("videotoolbox"):
+            return "videotoolbox", {}
+        return (None, {})
     for cand in ("vaapi", "qsv", "cuda"):
-        if ok(cand): return cand, {}
-    return None, {}
+        if ok(cand):
+            return cand, {}
+    return (None, {})
 
 
 # -------------------------
 # Imaging helpers
 # -------------------------
 
-def _resize_pad_to_rgb_bytes(img: Image.Image, size: Tuple[int, int]) -> bytes:
+def _resize_pad_to_rgb_bytes(img: Image.Image, size: tuple[int, int]) -> bytes:
     w, h = size
     if img.mode != "RGB":
         img = img.convert("RGB")
@@ -242,7 +298,7 @@ def _rotation_from_stream_and_frame(vstream, frame) -> int:
 # Frame iteration
 # -------------------------
 
-def _iter_frames_imageio(srcu: str, size: Tuple[int, int], loop_video: bool):
+def _iter_frames_imageio(srcu: str, size: tuple[int, int], loop_video: bool):
     default_delay_ms = 1000.0 / 10.0
     try:
         props = iio.improps(srcu)
@@ -285,7 +341,7 @@ def _iter_frames_imageio(srcu: str, size: Tuple[int, int], loop_video: bool):
             break
 
 
-def _open_with_hwaccel(srcu: str, prefer: str | None):
+def _open_with_hwaccel(srcu: str, prefer: Optional[str]):
     kind, _kw = pick_hw_backend(prefer)
     try:
         if kind:
@@ -301,27 +357,118 @@ def _open_with_hwaccel(srcu: str, prefer: str | None):
         vstream = next((s for s in container.streams if s.type == "video"), None)
         if vstream is None:
             raise RuntimeError("no video stream")
-        return container, vstream, None
+        return container, vstream
     except Exception as e:
         print(f"[hwaccel disabled: {kind or 'auto'} not available: {e}]")
         container = av.open(srcu, mode="r")
         vstream = next((s for s in container.streams if s.type == "video"), None)
         if vstream is None:
             raise RuntimeError("no video stream")
-        return container, vstream, None
+        return container, vstream
 
 
-def _iter_frames_pyav(srcu: str, size: Tuple[int, int], loop_video: bool,
-                      *, expand_mode: int, hw_prefer: str | None):
+def _choose_decode_preference(
+    srcu: str,
+    prefer: Optional[str],
+    out_size: tuple[int, int],
+    expand_mode: int
+) -> Optional[str]:
+    """
+    Decide CPU vs HW decode based on *input* properties (resolution/fps/codec),
+    output size, and expand_mode. Returns:
+      - "auto"  -> let pick_hw_backend() choose HW if available (CUDA, QSV, D3D11VA, VAAPI, etc.)
+      - "cpu"/"none"/None -> force CPU decode
+      - or the explicit user preference if provided (honored as-is)
+    Also prints a short diagnostic explaining the choice.
+    """
+    if prefer and str(prefer).lower() not in ("", "auto"):
+        print(f"[decode] prefer={prefer!r} explicitly requested -> honoring")
+        return prefer
+
+    TW, TH = out_size
+
+    # Probe input to get width/height/fps/codec
+    in_w = in_h = 0
+    in_fps: Optional[float] = None
+    in_codec = ""
+    try:
+        pc = av.open(srcu, mode="r")
+        try:
+            pvs = next((s for s in pc.streams if s.type == "video"), None)
+            if pvs is not None:
+                in_w = int(getattr(getattr(pvs, "codec_context", None), "width", 0) or getattr(pvs, "width", 0) or 0)
+                in_h = int(getattr(getattr(pvs, "codec_context", None), "height", 0) or getattr(pvs, "height", 0) or 0)
+                try:
+                    in_fps = float(pvs.average_rate) if pvs.average_rate else None
+                except Exception:
+                    in_fps = None
+                in_codec = (getattr(getattr(pvs, "codec", None), "name", "") or "").lower()
+        finally:
+            with contextlib.suppress(Exception):
+                pc.close()
+    except Exception as e:
+        print(f"[decode] probe failed ({e!r}); defaulting to auto -> pick_hw_backend()")
+        return "auto"
+
+    # Heuristics
+    BIG_PIXELS = 1920 * 1080
+    HIGH_FPS = 50.0
+    SMALL_OUT = 128 * 128
+    HARD_CODECS = ("hevc", "h265", "av1", "vp9")
+
+    input_big = (in_w * in_h) >= BIG_PIXELS
+    input_fast = (in_fps or 0.0) >= HIGH_FPS
+    hard_codec = any(k in in_codec for k in HARD_CODECS)
+    output_tiny = (TW * TH) <= SMALL_OUT
+    expand_needed = expand_mode in (1, 2)
+
+    reasons = []
+    if input_big:
+        reasons.append(">=1080p input")
+    if input_fast:
+        reasons.append(">=50 fps input")
+    if hard_codec:
+        reasons.append(f"hard codec ({in_codec or 'unknown'})")
+    if output_tiny and expand_needed:
+        reasons.append("tiny output + range-expand")
+
+    if input_big or input_fast or hard_codec:
+        kind, _ = pick_hw_backend("auto")
+        why = ", ".join(reasons) or "input suggests HW"
+        print(
+            f"[decode] in={in_w}x{in_h}@{(in_fps or 0):.2f}fps codec={in_codec or 'unknown'} "
+            f"out={TW}x{TH} expand={expand_mode} -> choosing HW ('auto') "
+            f"because {why}; auto maps to {kind or 'none'}"
+        )
+        return "auto"
+
+    why = ", ".join(reasons) or "small/slow input; HW adds overhead here"
+    print(
+        f"[decode] in={in_w}x{in_h}@{(in_fps or 0):.2f}fps codec={in_codec or 'unknown'} "
+        f"out={TW}x{TH} expand={expand_mode} -> choosing CPU because {why}"
+    )
+    return "cpu"
+
+
+def _iter_frames_pyav(
+    srcu: str,
+    size: tuple[int, int],
+    loop_video: bool,
+    *,
+    expand_mode: int,
+    hw_prefer: Optional[str]
+):
     TW, TH = size
 
-    def _tb_num_den(tb) -> Tuple[int, int]:
+    def _tb_num_den(tb) -> tuple[int, int]:
         if tb is None:
             return (1, 1000)
-        n = getattr(tb, "num", None); d = getattr(tb, "den", None)
+        n = getattr(tb, "num", None)
+        d = getattr(tb, "den", None)
         if n is not None and d is not None:
             return int(n), int(d)
-        n = getattr(tb, "numerator", None); d = getattr(tb, "denominator", None)
+        n = getattr(tb, "numerator", None)
+        d = getattr(tb, "denominator", None)
         if n is not None and d is not None:
             return int(n), int(d)
         try:
@@ -337,7 +484,9 @@ def _iter_frames_pyav(srcu: str, size: Tuple[int, int], loop_video: bool,
 
     while True:
         try:
-            container, vstream, dec = _open_with_hwaccel(srcu, hw_prefer)
+            # Decide CPU vs HW based on input size/fps/codec; still routed through pick_hw_backend
+            prefer = _choose_decode_preference(srcu, hw_prefer, (TW, TH), expand_mode)
+            container, vstream = _open_with_hwaccel(srcu, prefer)
             if vstream is None:
                 raise RuntimeError("no video stream")
 
@@ -361,13 +510,15 @@ def _iter_frames_pyav(srcu: str, size: Tuple[int, int], loop_video: bool,
                 g = AvFilterGraph()
 
                 tb_n, tb_d = _tb_num_den(frame.time_base or vstream.time_base)
+                fr_n, fr_d = _tb_num_den(getattr(vstream, "average_rate", None))
+                rate_arg = f":frame_rate={fr_n}/{fr_d}" if (fr_n and fr_d) else ""
                 src = g.add(
                     "buffer",
                     args=(
                         f"video_size={frame.width}x{frame.height}:"
-                        f"pix_fmt=rgb24:"
+                        f"pix_fmt={getattr(frame.format, 'name', 'rgb24')}:"
                         f"time_base={tb_n}/{tb_d}:"
-                        f"pixel_aspect=1/1"
+                        f"pixel_aspect=1/1" + rate_arg
                     ),
                 )
                 last = src
@@ -383,10 +534,18 @@ def _iter_frames_pyav(srcu: str, size: Tuple[int, int], loop_video: bool,
                         t2 = g.add("transpose", args="clock")
                         last.link_to(t1); t1.link_to(t2); last = t2
 
-                sc = g.add("scale", args=f"{TW}:{TH}:flags=bilinear:force_original_aspect_ratio=decrease")
+                expand_args = ""
+                if expand_mode == 2:
+                    expand_args = ":in_range=tv:out_range=pc"
+                elif expand_mode == 1:
+                    expand_args = ":in_range=auto:out_range=pc"
+                sc = g.add("scale", args=f"{TW}:{TH}:flags=bilinear:force_original_aspect_ratio=decrease" + expand_args)
                 last.link_to(sc); last = sc
                 pd = g.add("pad", args=f"{TW}:{TH}:(ow-iw)/2:(oh-ih)/2:color=black")
                 last.link_to(pd); last = pd
+
+                fmt = g.add("format", args="rgb24")
+                last.link_to(fmt); last = fmt
 
                 sink = g.add("buffersink")
                 last.link_to(sink)
@@ -399,28 +558,10 @@ def _iter_frames_pyav(srcu: str, size: Tuple[int, int], loop_video: bool,
             last_pts_s: Optional[float] = None
 
             for packet in container.demux(vstream):
-                frames = dec.decode(packet) if dec else packet.decode()
+                frames = packet.decode()
                 for frame in frames:
-                    arr = frame.to_ndarray(format="rgb24")
-
-                    do_expand = (expand_mode == 2)
-                    if expand_mode == 1:
-                        rng = getattr(frame, "color_range", None)
-                        try:
-                            rng_name = rng.name if hasattr(rng, "name") else str(rng)
-                        except Exception:
-                            rng_name = None
-                        do_expand = bool(rng_name and "mpeg" in str(rng_name).lower())
-                    if do_expand:
-                        arr = np.clip((arr.astype(np.int16) - 16) * 255 // 219, 0, 255).astype(np.uint8)
-                    elif arr.dtype is not np.uint8:
-                        arr = arr.astype(np.uint8)
-
-                    f_rgb = av.VideoFrame.from_ndarray(arr, format="rgb24")
-                    if getattr(f_rgb, "time_base", None) is None and getattr(vstream, "time_base", None):
-                        f_rgb.time_base = vstream.time_base
-                    _ensure_graph_for(f_rgb)
-                    src_in.push(f_rgb)  # type: ignore[name-defined]
+                    _ensure_graph_for(frame)
+                    src_in.push(frame)  # type: ignore[name-defined]
 
                     out_frames = []
                     while True:
@@ -448,8 +589,12 @@ def _iter_frames_pyav(srcu: str, size: Tuple[int, int], loop_video: bool,
                                 delay_ms = float(avg_ms) if (avg_ms is not None) else 33.33
                             else:
                                 delta_ms = (pts_s - last_pts_s) * 1000.0
-                                if delta_ms <= 0 and (avg_ms is not None):
-                                    delta_ms = float(avg_ms)
+                                if avg_ms is not None:
+                                    low = 0.75 * avg_ms
+                                    high = 1.25 * avg_ms
+                                    delta_ms = max(low, min(high, delta_ms))
+                                elif delta_ms <= 0:
+                                    delta_ms = 33.33
                                 delay_ms = max(MIN_DELAY_MS, float(delta_ms))
                             last_pts_s = pts_s
 
@@ -469,8 +614,14 @@ def _iter_frames_pyav(srcu: str, size: Tuple[int, int], loop_video: bool,
             break
 
 
-def iter_frames(src: str, size: Tuple[int, int], loop_video: bool = True,
-                *, expand_mode: int, hw_prefer: str | None):
+def iter_frames(
+    src: str,
+    size: tuple[int, int],
+    loop_video: bool = True,
+    *,
+    expand_mode: int,
+    hw_prefer: Optional[str]
+):
     srcu = unquote(src)
     low = srcu.lower()
     if not any(low.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif")):
@@ -483,16 +634,28 @@ def iter_frames(src: str, size: Tuple[int, int], loop_video: bool = True,
 # DDP packetizer
 # -------------------------
 
+# Max payload per DDP packet. 1440 keeps UDP datagrams < 1500B MTU
+# (IP+UDP+DDP header overhead), reducing fragmentation on typical links.
 _DDP_MAX_DATA = 1440
-_DDP_HDR = struct.Struct("!BBB B I H")
+
+# DDP header layout (big-endian):
+#   flags: 0x40 => header present, 0x01 => PUSH (end-of-frame)
+#   seq:   0..255 sequence number (low 8 bits used)
+#   cfg:   pixel config; 0x2C = RGB888 (per 3waylabs DDP spec)
+#   out_id: destination output/canvas id (0..255)
+#   offset: byte offset within the frame buffer
+#   length: payload bytes in this packet
+_DDP_HDR = struct.Struct("!BBB B I H")  # flags, seq, cfg, out_id, offset, length
 _DDP_PIXEL_CFG_RGB888 = 0x2C
 
+
 def _ddp_iter_packets(rgb_bytes: bytes, output_id: int, seq: int):
+    """Yield complete DDP packets for a frame."""
     mv = memoryview(rgb_bytes)
     total = len(mv)
     off = 0
     push_mask = 0x01
-    ddp_base_flags = 0x40
+    ddp_base_flags = 0x40  # header present
     while off < total:
         end = min(off + _DDP_MAX_DATA, total)
         chunk = mv[off:end]
@@ -500,7 +663,8 @@ def _ddp_iter_packets(rgb_bytes: bytes, output_id: int, seq: int):
         flags = ddp_base_flags | (push_mask if is_last else 0)
         payload_len = len(chunk)
         pkt = bytearray(_DDP_HDR.size + payload_len)
-        _DDP_HDR.pack_into(pkt, 0,
+        _DDP_HDR.pack_into(
+            pkt, 0,
             flags,
             seq & 0xFF,
             _DDP_PIXEL_CFG_RGB888,
@@ -519,11 +683,11 @@ def _ddp_iter_packets(rgb_bytes: bytes, output_id: int, seq: int):
 
 class _UDPSender(asyncio.DatagramProtocol):
     def __init__(self):
-        self.transport: asyncio.DatagramTransport | None = None
+        self.transport: Optional[asyncio.DatagramTransport] = None
         self.packets_sent = 0
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
-        self.transport = transport
+        self.transport = transport  # type: ignore[assignment]
 
     def error_received(self, exc: BaseException) -> None:
         print(f"[udp] error_received: {exc!r}")
@@ -534,56 +698,19 @@ class _UDPSender(asyncio.DatagramProtocol):
 
     def sendto(self, data: bytes, addr):
         if self.transport is not None:
-            self.transport.sendto(data, addr)
+            self.transport.sendto(data, addr)  # type: ignore[union-attr]
             self.packets_sent += 1
 
 
 # -------------------------
-# Paced sender (upsample)
-# -------------------------
-
-async def _paced_sender(loop, q, *, pace_hz, ema_alpha, get_latest_bytes, out_id, proto):
-    next_t = loop.time()
-    tick_s = 1.0 / pace_hz
-    ema_buf: Optional[np.ndarray] = None
-    seq = 0
-
-    while True:
-        buf = get_latest_bytes()
-        if buf is not None:
-            if ema_alpha > 0.0:
-                cur = np.frombuffer(buf, dtype=np.uint8)
-                if ema_buf is None or ema_buf.shape != cur.shape:
-                    ema_buf = cur.astype(np.float32, copy=True)
-                else:
-                    ema_buf *= (1.0 - ema_alpha)
-                    ema_buf += cur.astype(np.float32) * ema_alpha
-                outb = ema_buf.astype(np.uint8, copy=False).tobytes()
-            else:
-                outb = buf
-
-            for pkt in _ddp_iter_packets(outb, out_id, seq):
-                if q.full():
-                    try:
-                        q.get_nowait(); q.task_done()
-                    except asyncio.QueueEmpty:
-                        pass
-                await q.put(pkt)
-            seq = (seq + 1) & 0x0F
-
-        await asyncio.sleep(max(0.0, next_t - loop.time()))
-        next_t += tick_s
-
-
-# -------------------------
-# Main task per connection (CORRECTED)
+# Main DDP task
 # -------------------------
 
 async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, opts):
-    """If pace_hz>0: producer (native) + paced sender. Else: native-cadence push.
+    """If pace_hz>0: producer (native) + paced sampler. Else: native-cadence push.
        Non-blocking UDP with bounded queue. Optional per-frame packet spreading.
     """
-    import socket, time
+    import socket
     from collections import deque
 
     w, h = size
@@ -601,10 +728,9 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
     # Config
     log_cfg = CONFIG.get("log", {})
     log_metrics = bool(log_cfg.get("metrics", True))
-    log_detail  = bool(log_cfg.get("detail", False))
     log_rate_ms = int(log_cfg.get("rate_ms", 1000))
-    spread_enabled = bool(CONFIG.get("net", {}).get("spread_packets", False))
-    spread_max_fps = int(CONFIG.get("net", {}).get("spread_max_fps", 120))
+    spread_enabled = bool(CONFIG.get("net", {}).get("spread_packets", True))
+    spread_max_fps = int(CONFIG.get("net", {}).get("spread_max_fps", 60))
 
     # Meters
     pkt_meter = _RateMeter()
@@ -639,7 +765,7 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
 
         drain_task = asyncio.create_task(drainer())
 
-        pace_hz   = int(opts.get("pace_hz", 0))
+        pace_hz = int(opts.get("pace_hz", 0))
         ema_alpha = float(opts.get("ema_alpha", 0.0))
 
         frames_emitted = 0
@@ -649,45 +775,34 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
 
         async def enqueue_frame(rgb888: bytes, seq_val: int,
                                 *, packet_spacing_s: Optional[float] = None,
-                                group_n: int = 1):
+                                   group_n: int = 1):
             nonlocal packets_enqueued, q_drops
-            total_len = len(rgb888)
-            off = 0
-            slot_idx = 0
+            group_n = max(1, int(group_n))
             start_ts = loop.time() if (packet_spacing_s and packet_spacing_s > 0.0) else None
-            while off < total_len:
-                # group_n packets per timeslot (to avoid micro-sleeps)
-                group_left = group_n if group_n > 0 else 1
-                end = min(off + _DDP_MAX_DATA, total_len)
-                chunk = rgb888[off:end]
-                is_last = end >= total_len
-                flags = 0x40 | (0x01 if is_last else 0)
-                pkt = bytearray(_DDP_HDR.size + len(chunk))
-                _DDP_HDR.pack_into(pkt, 0,
-                    flags, seq_val & 0xFF, _DDP_PIXEL_CFG_RGB888, out_id & 0xFF, off, len(chunk)
-                )
-                pkt[_DDP_HDR.size:] = chunk
+            slot_idx = 0
+            group_left = group_n
 
-                # enqueue immediately; we'll sleep after sending 'group_n' packets
+            for pkt in _ddp_iter_packets(rgb888, out_id, seq_val):
                 if q.full():
                     try:
-                        q.get_nowait(); q.task_done(); q_drops += 1
+                        q.get_nowait()
+                        q.task_done()
+                        q_drops += 1
                     except asyncio.QueueEmpty:
                         pass
-                await q.put(bytes(pkt))
+                await q.put(pkt)
                 packets_enqueued += 1
+
                 group_left -= 1
-                off = end
-                # If we've sent a group and spacing is configured, sleep until next slot
                 if group_left <= 0 and start_ts is not None and packet_spacing_s and packet_spacing_s > 0.0:
                     slot_idx += 1
                     target = start_ts + slot_idx * packet_spacing_s
                     await asyncio.sleep(max(0.0, target - loop.time()))
-                    group_left = group_n if group_n > 0 else 1
+                    group_left = group_n
 
         if pace_hz > 0:
-            # Pacing path
-            latest: Dict[str, Optional[bytes]] = {"buf": None}
+            # Pacing path (producer + sampler). EMA is applied in the sampler.
+            latest: dict[str, Optional[bytes]] = {"buf": None}
             latest_lock = asyncio.Lock()
 
             async def producer():
@@ -702,20 +817,17 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
 
                     now = time.perf_counter()
                     if now - last_log >= (log_rate_ms / 1000.0):
-                        if log_metrics:
-                            fps = frm_meter.rate_hz()
-                            pps = pkt_meter.rate_hz()
-                            pkt_jit = pkt_meter.jitter_ms()
-                            frm_jit = frm_meter.jitter_ms()
-                            q_avg = (sum(q_occ_samples)/len(q_occ_samples)) if q_occ_samples else 0
-                            q_max = max(q_occ_samples) if q_occ_samples else 0
-                            spread_tag = (" (spread)" if (spread_enabled and pace_hz <= spread_max_fps) else "")
-                            print(f"[send] out={out_id} pace={pace_hz}Hz fps={fps:.2f} pps={pps:.0f} "
-                                  f"pkt_jit={pkt_jit:.1f}ms frm_jit={frm_jit:.1f}ms "
-                                  f"q_avg={q_avg:.0f}/{max_in_flight} q_max={q_max} "
-                                  f"enq={packets_enqueued} tx={proto.packets_sent} drops={q_drops}{spread_tag}")
-                        else:
-                            print(f"[send] out={out_id} pace={pace_hz}Hz frames={frames_emitted} enq={packets_enqueued} tx={proto.packets_sent}")
+                        fps = frm_meter.rate_hz()
+                        pps = pkt_meter.rate_hz()
+                        pkt_jit = pkt_meter.jitter_ms()
+                        frm_jit = frm_meter.jitter_ms()
+                        q_avg = (sum(q_occ_samples)/len(q_occ_samples)) if q_occ_samples else 0
+                        q_max = max(q_occ_samples) if q_occ_samples else 0
+                        spread_tag = (" (spread)" if (spread_enabled and pace_hz <= spread_max_fps) else "")
+                        print(f"[send] out={out_id} pace={pace_hz}Hz fps={fps:.2f} pps={pps:.0f} "
+                              f"pkt_jit={pkt_jit:.1f}ms frm_jit={frm_jit:.1f}ms "
+                              f"q_avg={q_avg:.0f}/{max_in_flight} q_max={q_max} "
+                              f"enq={packets_enqueued} tx={proto.packets_sent} drops={q_drops}{spread_tag}")
                         frames_emitted = 0
                         q_occ_samples.clear()
                         last_log = now
@@ -725,23 +837,27 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
             async def sampler():
                 tick = 1.0 / pace_hz
                 next_t = loop.time()
+                ema_buf_f32: Optional[np.ndarray] = None
+
                 while True:
                     buf = latest["buf"]
                     if buf is not None:
-                        if spread_enabled and pace_hz <= spread_max_fps:
-                            pkt_count = (len(buf) + _DDP_MAX_DATA - 1) // _DDP_MAX_DATA
-                            spacing = (tick / pkt_count) if pkt_count > 0 else None
-                            if spacing and spacing > 0.0:
-                                min_s = float(CONFIG.get('net', {}).get('spread_min_ms', 3.0)) / 1000.0
-                                import math
-                                group_n = max(1, int(math.ceil(min_s / spacing)))
-                                spacing = spacing * group_n
+                        outb = buf
+                        if ema_alpha > 0.0:
+                            cur = np.frombuffer(buf, dtype=np.uint8)
+                            if ema_buf_f32 is None or ema_buf_f32.shape != cur.shape:
+                                ema_buf_f32 = cur.astype(np.float32, copy=True)
                             else:
-                                group_n = 1
+                                ema_buf_f32 *= (1.0 - ema_alpha)
+                                ema_buf_f32 += cur.astype(np.float32) * ema_alpha
+                            outb = ema_buf_f32.astype(np.uint8, copy=False).tobytes()
+
+                        if spread_enabled and pace_hz <= spread_max_fps:
+                            pkt_count = (len(outb) + _DDP_MAX_DATA - 1) // _DDP_MAX_DATA
+                            spacing, group_n = _compute_spacing_and_group(pkt_count, tick)
                         else:
-                            spacing = None
-                            group_n = 1
-                        await enqueue_frame(buf, seq, packet_spacing_s=spacing, group_n=group_n)
+                            spacing, group_n = (None, 1)
+                        await enqueue_frame(outb, seq, packet_spacing_s=spacing, group_n=group_n)
 
                     if log_metrics:
                         q_occ_samples.append(q.qsize())
@@ -760,29 +876,19 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
 
         else:
             # Native cadence
-            last_log = time.perf_counter()
             next_t = loop.time()
             for rgb888, delay_ms in frames:
                 delay_s = max(MIN_DELAY_MS/1000.0, float(delay_ms)/1000.0)
 
                 if spread_enabled:
-                    inst_fps = (1.0/delay_s) if delay_s > 0 else 1e9
+                    inst_fps = (1.0 / delay_s) if delay_s > 0 else 1e9
                     if inst_fps <= spread_max_fps:
                         pkt_count = (len(rgb888) + _DDP_MAX_DATA - 1) // _DDP_MAX_DATA
-                        spacing = (delay_s / pkt_count) if pkt_count > 0 else None
-                        if spacing and spacing > 0.0:
-                            min_s = float(CONFIG.get('net', {}).get('spread_min_ms', 3.0)) / 1000.0
-                            import math
-                            group_n = max(1, int(math.ceil(min_s / spacing)))
-                            spacing = spacing * group_n
-                        else:
-                            group_n = 1
+                        spacing, group_n = _compute_spacing_and_group(pkt_count, delay_s)
                     else:
-                        spacing = None
-                        group_n = 1
+                        spacing, group_n = (None, 1)
                 else:
-                    spacing = None
-                    group_n = 1
+                    spacing, group_n = (None, 1)
 
                 await enqueue_frame(rgb888, seq, packet_spacing_s=spacing, group_n=group_n)
                 seq = (seq + 1) & 0x0F
@@ -794,21 +900,18 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
 
                 now = time.perf_counter()
                 if now - last_log >= (log_rate_ms / 1000.0):
-                    if log_metrics:
-                        fps = frm_meter.rate_hz()
-                        pps = pkt_meter.rate_hz()
-                        pkt_jit = pkt_meter.jitter_ms()
-                        frm_jit = frm_meter.jitter_ms()
-                        q_avg = (sum(q_occ_samples)/len(q_occ_samples)) if q_occ_samples else 0
-                        q_max = max(q_occ_samples) if q_occ_samples else 0
-                        target = 1000.0 / max(float(delay_ms), 1.0)
-                        spread_tag = (" (spread)" if spacing else "")
-                        print(f"[send] out={out_id} native fps={fps:.2f} (~{target:.1f} tgt) pps={pps:.0f} "
-                              f"pkt_jit={pkt_jit:.1f}ms frm_jit={frm_jit:.1f}ms "
-                              f"q_avg={q_avg:.0f}/{max_in_flight} q_max={q_max} "
-                              f"enq={packets_enqueued} tx={proto.packets_sent} drops={q_drops}{spread_tag}")
-                    else:
-                        print(f"[send] out={out_id} native frames={frames_emitted} enq={packets_enqueued} tx={proto.packets_sent}")
+                    fps = frm_meter.rate_hz()
+                    pps = pkt_meter.rate_hz()
+                    pkt_jit = pkt_meter.jitter_ms()
+                    frm_jit = frm_meter.jitter_ms()
+                    q_avg = (sum(q_occ_samples)/len(q_occ_samples)) if q_occ_samples else 0
+                    q_max = max(q_occ_samples) if q_occ_samples else 0
+                    target = 1000.0 / max(float(delay_ms), 1.0)
+                    spread_tag = (" (spread)" if spacing else "")
+                    print(f"[send] out={out_id} native fps={fps:.2f} (~{target:.1f} tgt) pps={pps:.0f} "
+                          f"pkt_jit={pkt_jit:.1f}ms frm_jit={frm_jit:.1f}ms "
+                          f"q_avg={q_avg:.0f}/{max_in_flight} q_max={q_max} "
+                          f"enq={packets_enqueued} tx={proto.packets_sent} drops={q_drops}{spread_tag}")
                     frames_emitted = 0
                     q_occ_samples.clear()
                     last_log = now
@@ -816,14 +919,36 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
                 next_t += delay_s
                 await asyncio.sleep(max(0.0, next_t - loop.time()))
 
-        await q.join()
-        drain_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await drain_task
+        # Try to flush the queue quickly; don't hang forever if we're being cancelled.
+        try:
+            await asyncio.wait_for(q.join(), timeout=0.5)
+        except Exception:
+            pass
+        finally:
+            if drain_task:
+                drain_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await drain_task
 
+    except asyncio.CancelledError:
+        try:
+            if drain_task:
+                drain_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await drain_task
+        except Exception:
+            pass
+        raise
     except Exception as e:
         print(f"[send] out={out_id} fatal error: {e!r}")
         traceback.print_exc()
+        try:
+            if drain_task:
+                drain_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await drain_task
+        except Exception:
+            pass
         raise
     finally:
         try:
@@ -837,9 +962,10 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
             pass
 
 
-# =========================
+# -------------------------
 # WebSocket control
-# =========================
+# -------------------------
+
 CONFIG: Dict[str, Any] = DEFAULT_CONFIG
 
 
@@ -851,14 +977,16 @@ def _is_benign_disconnect(exc: BaseException) -> bool:
 
 def _parse_expand(val, default):
     s = str(val if val is not None else default).lower()
-    if s in ("2", "force"):  return 2
-    if s in ("0", "false", "never"): return 0
+    if s in ("2", "force"):
+        return 2
+    if s in ("0", "false", "never"):
+        return 0
     return 1  # auto
 
 
 def _parse_hw(val, default):
     s = (val if val is not None else default)
-    return None if str(s).lower() in ("none","off","cpu") else str(s)
+    return None if str(s).lower() in ("none", "off", "cpu") else str(s)
 
 
 def _parse_pace_hz(v):
@@ -880,9 +1008,10 @@ async def handle_control(ws):
     }
 
     async def start_stream(msg):
-        _require_fields(msg, ("out","w","h","src"), "start_stream")
+        _require_fields(msg, ("out", "w", "h", "src"), "start_stream")
         out = int(msg["out"])
-        w = int(msg["w"]); h = int(msg["h"])
+        w = int(msg["w"])
+        h = int(msg["h"])
         if w <= 0 or h <= 0:
             raise ValueError(f"start_stream requires positive w/h (got {w}x{h})")
         src = str(msg["src"])
@@ -893,7 +1022,6 @@ async def handle_control(ws):
             "loop": _truthy(str(msg.get("loop", CONFIG["playback"]["loop"]))),
             "expand_mode": _parse_expand(msg.get("expand"), CONFIG["video"]["expand_mode"]),
             "hw": _parse_hw(msg.get("hw"), CONFIG["hw"]["prefer"]),
-            "log_send_ms": bool(CONFIG["log"].get("send_ms", False)),
             "pace_hz": pace_hz,
             "ema_alpha": max(0.0, min(float(msg.get("ema", 0.0)), 1.0)),
         }
@@ -957,14 +1085,13 @@ async def handle_control(ws):
 
         base = {"type": "start_stream", "out": out}
         applied = {}
-        for k in ("w","h","ddp_port","src","pace","ema","expand","loop","hw"):
+        for k in ("w", "h", "ddp_port", "src", "pace", "ema", "expand", "loop", "hw"):
             if k in msg:
                 base[k] = msg[k]
                 applied[k] = msg[k]
 
         await stop_stream({"out": out})
         await start_stream(base)
-
         await _ws_send(ws, {"type": "ack", "out": out, "applied": applied})
 
     # --- handshake ---
@@ -981,13 +1108,13 @@ async def handle_control(ws):
         return
 
     if hello.get("type") != "hello":
-        await _ws_send(ws, {"type":"error","code":"proto","message":"expect 'hello' first"})
+        await _ws_send(ws, {"type": "error", "code": "proto", "message": "expect 'hello' first"})
         await ws.close(code=4001, reason="protocol")
         return
 
-    session["device_id"] = hello.get("device_id","unknown")
+    session["device_id"] = hello.get("device_id", "unknown")
     print(f"* hello from {session['ip']} dev={session['device_id']} proto={hello.get('proto')}")
-    await _ws_send(ws, {"type":"hello_ack","server_version":"lvgl-ddp-stream/1"})
+    await _ws_send(ws, {"type": "hello_ack", "server_version": "lvgl-ddp-stream/1"})
 
     try:
         async for raw in ws:
@@ -1001,13 +1128,13 @@ async def handle_control(ws):
                 elif t == "update":
                     await update_stream(msg)
                 elif t == "ping":
-                    await _ws_send(ws, {"type":"pong","t": msg.get("t")})
+                    await _ws_send(ws, {"type": "pong", "t": msg.get("t")})
                 else:
-                    await _ws_send(ws, {"type":"error","code":"bad_type","message":f"unknown type {t}"})
+                    await _ws_send(ws, {"type": "error", "code": "bad_type", "message": f"unknown type {t}"})
             except (ValueError, FileNotFoundError) as e:
-                await _ws_send(ws, {"type":"error","code":"bad_request","message":str(e)})
+                await _ws_send(ws, {"type": "error", "code": "bad_request", "message": str(e)})
             except Exception as e:
-                await _ws_send(ws, {"type":"error","code":"server_error","message":str(e)})
+                await _ws_send(ws, {"type": "error", "code": "server_error", "message": str(e)})
     except Exception as loop_exc:
         if _is_benign_disconnect(loop_exc):
             reason = getattr(loop_exc, 'reason', '') or (getattr(loop_exc, 'args', [''])[0])
@@ -1016,7 +1143,7 @@ async def handle_control(ws):
             print(f"[warn] control loop error from {session['ip']}: {loop_exc!r}")
     finally:
         async with streams_lock:
-            for out, t in list(streams.items()):
+            for _out, t in list(streams.items()):
                 t.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 if streams:
