@@ -28,8 +28,10 @@ void WsDdpControl::ws_event_trampoline(void *arg,
 
   switch (event_id) {
     case WEBSOCKET_EVENT_CONNECTED:
+      if (self->running_) break;               // NEW: ignore duplicate CONNECTED
       ESP_LOGI(TAG, "connected");
       self->running_ = true;
+      self->connecting_ = false;               // NEW: connecting -> false
       self->send_hello_();
       // replay all active streams
       for (auto &kv : self->active_) if (kv.second) self->start_(kv.first);
@@ -39,6 +41,7 @@ void WsDdpControl::ws_event_trampoline(void *arg,
     case WEBSOCKET_EVENT_DISCONNECTED:
       ESP_LOGW(TAG, "disconnected");
       self->running_ = false;
+      self->connecting_ = false;               // NEW
       break;
 
     case WEBSOCKET_EVENT_ERROR:
@@ -75,14 +78,25 @@ std::string WsDdpControl::build_uri_() const {
 
 // ------------- lifecycle -------------
 void WsDdpControl::connect() {
-  if (running_) return;
+  if (running_ || connecting_ || client_) return;   // NEW: idempotent
   if (!network::is_connected()) {
     ESP_LOGI(TAG, "network not ready; deferring connect");
     pending_connect_ = true;
     this->set_timeout(500, [this](){ this->connect(); });
     return;
   }
+
+  // If URI isn’t ready yet (templated host/url not populated), retry soon
+  const std::string uri = this->build_uri_();
+  if (uri.empty()) {
+    ESP_LOGI(TAG, "URI not ready; retrying connect soon");
+    pending_connect_ = true;
+    this->set_timeout(500, [this](){ this->connect(); });
+    return;
+  }
+
   pending_connect_ = false;
+  connecting_ = true;                            // NEW
   this->do_connect_();
 }
 
@@ -90,6 +104,7 @@ void WsDdpControl::do_connect_() {
   const std::string uri = this->build_uri_();
   if (uri.empty()) {
     ESP_LOGW(TAG, "connect(): no URI (provide url: or ws_host:/ws_port:)");
+    connecting_ = false;                         // NEW
     return;
   }
 
@@ -108,6 +123,7 @@ void WsDdpControl::do_connect_() {
     ESP_LOGE(TAG, "init failed");
     static uint32_t backoff_ms = 500;
     backoff_ms = std::min<uint32_t>(backoff_ms * 2, 10000);
+    connecting_ = false;                         // NEW
     this->set_timeout(backoff_ms, [this](){ this->connect(); });
     return;
   }
@@ -121,6 +137,7 @@ void WsDdpControl::do_connect_() {
     client_ = nullptr;
     static uint32_t backoff_ms = 500;
     backoff_ms = std::min<uint32_t>(backoff_ms * 2, 10000);
+    connecting_ = false;                         // NEW
     this->set_timeout(backoff_ms, [this](){ this->connect(); });
     return;
   }
@@ -128,12 +145,14 @@ void WsDdpControl::do_connect_() {
   err = esp_websocket_client_start((esp_websocket_client_handle_t) client_);
   if (err == ESP_OK) {
     ESP_LOGI(TAG, "started");
+    // leave connecting_=true until CONNECTED arrives
   } else {
     ESP_LOGE(TAG, "start failed: 0x%X", (unsigned) err);
     esp_websocket_client_destroy((esp_websocket_client_handle_t) client_);
     client_ = nullptr;
     static uint32_t backoff_ms = 500;
     backoff_ms = std::min<uint32_t>(backoff_ms * 2, 10000);
+    connecting_ = false;                         // NEW
     this->set_timeout(backoff_ms, [this](){ this->connect(); });
   }
 }
@@ -141,6 +160,7 @@ void WsDdpControl::do_connect_() {
 void WsDdpControl::disconnect() {
   if (!client_) {
     running_ = false;
+    connecting_ = false;                         // NEW
     pending_connect_ = false;
     return;
   }
@@ -149,6 +169,7 @@ void WsDdpControl::disconnect() {
   esp_websocket_client_destroy((esp_websocket_client_handle_t) client_);
   client_ = nullptr;
   running_ = false;
+  connecting_ = false;                           // NEW
   pending_connect_ = false;
 }
 
@@ -185,6 +206,8 @@ void WsDdpControl::start(uint8_t out) {
   active_[out] = true;
   if (!this->is_connected()) {
     ESP_LOGD(TAG, "start: deferring out=%u until WS connects", (unsigned) out);
+    // ensure we are actively trying to connect
+    if (!pending_connect_) this->connect();
     return;
   }
   this->start_(out);
@@ -196,7 +219,10 @@ void WsDdpControl::stop(uint8_t out) {
 
 void WsDdpControl::set_src(uint8_t out, const std::string &s) {
   shadow_src_[out] = s;
-  if (active_[out] && this->is_connected()) this->send_update_(out);
+  if (active_[out] && this->is_connected()) {
+    // restart with full start_stream so server gets w/h/ddp_port/src
+    this->start_(out);
+  }
 }
 void WsDdpControl::set_pace(uint8_t out, int pace) {
   shadow_pace_[out] = pace;
@@ -325,11 +351,19 @@ void WsDdpControl::send_update_(uint8_t out) {
   int   expand = shadow_expand_.count(out) ? shadow_expand_.at(out) : o.expand;
   bool  loop   = shadow_loop_.count(out)   ? shadow_loop_.at(out)   : o.loop;
 
+  // include w/h and ddp_port so server.update_stream can safely reissue start_stream
+  int w=0, h=0;
+  this->resolve_size_(out, &w, &h);
+  uint16_t ddp_port = ddp_ ? ddp_->get_port() : 4048;
+
   std::string json;
   json.reserve(256);
   json += "{";
   append_json_str(json, "type", "update"); json += ",";
   append_json_int(json, "out", out);       json += ",";
+  append_json_int(json, "w", w);           json += ",";
+  append_json_int(json, "h", h);           json += ",";
+  append_json_int(json, "ddp_port", ddp_port); json += ",";
   append_json_str(json, "src", json_escape_(src)); json += ",";
   append_json_int(json, "pace", pace);     json += ",";
   append_json_float(json, "ema", ema);     json += ",";
@@ -338,8 +372,8 @@ void WsDdpControl::send_update_(uint8_t out) {
   append_json_str(json, "hw", json_escape_(hw));
   json += "}";
 
-  ESP_LOGI(TAG, "tx update out=%u src=%s pace=%d ema=%.3f expand=%d loop=%s hw=%s",
-           (unsigned) out, src.c_str(), pace, (double) ema, expand, loop ? "true":"false", hw.c_str());
+  ESP_LOGI(TAG, "tx update out=%u w=%d h=%d ddp_port=%u src=%s pace=%d ema=%.3f expand=%d loop=%s hw=%s",
+           (unsigned) out, w, h, (unsigned) ddp_port, src.c_str(), pace, (double) ema, expand, loop ? "true":"false", hw.c_str());
   this->send_text(json);
 }
 

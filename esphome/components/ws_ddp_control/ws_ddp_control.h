@@ -96,6 +96,7 @@ class WsDdpControl : public Component {
   // ws state
   void *client_{nullptr};
   bool running_{false};
+  bool connecting_{false};      // NEW: prevent double connects
   bool pending_connect_{false};
   std::function<void()> on_connected_{};
 
