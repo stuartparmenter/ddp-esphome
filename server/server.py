@@ -77,7 +77,17 @@ MIN_DELAY_MS = 10.0  # clamp very small frame delays
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "hw": {"prefer": "auto"},
-    "video": {"expand_mode": 1},  # 0=never, 1=auto(limited->full), 2=force
+    "video": {
+        "expand_mode": 1,  # 0=never, 1=auto(limited->full), 2=force
+        "fit": "auto-pad",  # "pad" | "cover" | "auto-pad" | "auto-cover"
+        "autocrop": {
+            "enabled": True,
+            "probe_frames": 8,
+            "luma_thresh": 22,
+            "max_bar_ratio": 0.20,
+            "min_bar_px": 2
+        }
+    },
     "playback": {"loop": True},
     "log": {"send_ms": False, "rate_ms": 1000, "detail": False, "metrics": True},
     "net": {
@@ -553,6 +563,49 @@ def _iter_frames_pyav(
 
     # Resolve YouTube page URLs to direct media + headers
     real_srcu, http_opts = _resolve_stream_url(srcu)
+    # --- Auto-crop (black bar) config/state ---
+    ac_cfg = CONFIG.get("video", {}).get("autocrop", {}) or {}
+    ac_enabled = bool(ac_cfg.get("enabled", True))
+    ac_probe_frames = int(ac_cfg.get("probe_frames", 8))
+    ac_thresh = int(ac_cfg.get("luma_thresh", 22))
+    ac_max_ratio = float(ac_cfg.get("max_bar_ratio", 0.20))
+    ac_min_px = int(ac_cfg.get("min_bar_px", 2))
+    ac_samples = {"l": [], "r": [], "t": [], "b": []}
+    ac_decided = False
+    ac_crop = {"l": 0, "r": 0, "t": 0, "b": 0}  # in source pixel coords
+    ac_seen = 0
+
+    def _estimate_black_bars(frame_w: int, frame_h: int, gray: np.ndarray,
+                             thresh: int, min_px: int, max_ratio: float) -> dict:
+        """Return {'l','r','t','b'} estimated black bar widths in pixels for one frame."""
+        h, w = gray.shape  # (H, W)
+        # Walk inward from each edge until median luma > thresh
+        def walk_left():
+            cap = int(w * max_ratio); x = 0
+            while x < min(cap, w - 1):
+                if int(np.median(gray[:, x:min(x+4, w)])) > thresh: break
+                x += 1
+            return max(min_px if x >= min_px else 0, min(x, cap))
+        def walk_right():
+            cap = int(w * max_ratio); x = 0
+            while x < min(cap, w - 1):
+                if int(np.median(gray[:, max(0, w-1-(x+3)):w-x])) > thresh: break
+                x += 1
+            return max(min_px if x >= min_px else 0, min(x, cap))
+        def walk_top():
+            cap = int(h * max_ratio); y = 0
+            while y < min(cap, h - 1):
+                if int(np.median(gray[y:min(y+4, h), :])) > thresh: break
+                y += 1
+            return max(min_px if y >= min_px else 0, min(y, cap))
+        def walk_bot():
+            cap = int(h * max_ratio); y = 0
+            while y < min(cap, h - 1):
+                if int(np.median(gray[max(0, h-1-(y+3)):h-y, :])) > thresh: break
+                y += 1
+            return max(min_px if y >= min_px else 0, min(y, cap))
+        return {"l": walk_left(), "r": walk_right(), "t": walk_top(), "b": walk_bot()}
+
 
     try:
         from av.error import BlockingIOError as AvBlockingIOError  # type: ignore
@@ -619,6 +672,7 @@ def _iter_frames_pyav(
                     pass
                 return (1, 1)
 
+
             def _ensure_graph_for(frame) -> None:
                 """(Re)build the filter graph if geometry/SAR/format/rotation changed."""
                 nonlocal graph, src_in, sink_out, first_graph_log_done, g_props
@@ -628,20 +682,25 @@ def _iter_frames_pyav(
                 sar_n, sar_d = _sar_of(frame)
                 rot = _rotation_from_stream_and_frame(vstream, frame)
 
+                # Track whether we've already applied the autocrop in the current graph
+                applied_ac = g_props.get("ac_applied", False)
+                want_ac = bool(ac_enabled and ac_decided and any(v > 0 for v in ac_crop.values()))
+
                 need_rebuild = (
                     graph is None or
                     g_props["w"] != w or
                     g_props["h"] != h or
                     g_props["fmt"] != fmt_name or
                     g_props["sar"] != (sar_n, sar_d) or
-                    g_props["rot"] != rot
+                    g_props["rot"] != rot or
+                    (want_ac and not applied_ac)
                 )
                 if not need_rebuild:
                     return
 
                 old = g_props.copy()
-                g_props.update({"w": w, "h": h, "fmt": fmt_name, "sar": (sar_n, sar_d), "rot": rot})
-                print(f"[graph] rebuild: {old} -> {g_props}")
+                g_props.update({"w": w, "h": h, "fmt": fmt_name, "sar": (sar_n, sar_d), "rot": rot, "ac_applied": want_ac})
+                print(f"[graph] rebuild: {old} -> {g_props} (ac={ac_crop if (ac_enabled and ac_decided) else 'pending'})")
 
                 if not first_graph_log_done:
                     try:
@@ -658,7 +717,7 @@ def _iter_frames_pyav(
                 fr_n, fr_d = _tb_num_den(getattr(vstream, "average_rate", None))
                 rate_arg = f":frame_rate={fr_n}/{fr_d}" if (fr_n and fr_d) else ""
 
-                # buffersrc with *actual* SAR; we normalize to square pixels later
+                # buffersrc with input SAR (we normalize later)
                 src = g.add(
                     "buffer",
                     args=(
@@ -670,13 +729,22 @@ def _iter_frames_pyav(
                 )
                 last = src
 
-                # --- Graph: unsqueeze PAR -> setsar=1 -> rotate -> scale+pad -> setdar=1 -> rgb24 ---
-                n = g.add("scale", args="iw*sar:ih")      # unsqueeze PAR into geometry
+                # (A) autocrop baked bars in source pixel coords, if decided
+                if want_ac:
+                    L, R, T, B = ac_crop["l"], ac_crop["r"], ac_crop["t"], ac_crop["b"]
+                    cw = max(1, w - (L + R))
+                    ch = max(1, h - (T + B))
+                    n = g.add("crop", args=f"{cw}:{ch}:{L}:{T}")
+                    last.link_to(n); last = n
+
+                # unsqueeze PAR -> setsar=1
+                n = g.add("scale", args="iw*sar:ih")
                 last.link_to(n); last = n
-                n = g.add("setsar", args="1")             # enforce square pixels from here on
+                n = g.add("setsar", args="1")
                 last.link_to(n); last = n
 
-                if rot in (90, 180, 270):                 # correct rotation metadata
+                # rotate (metadata) if needed
+                if rot in (90, 180, 270):
                     if rot == 90:
                         n = g.add("transpose", args="clock"); last.link_to(n); last = n
                     elif rot == 270:
@@ -686,20 +754,29 @@ def _iter_frames_pyav(
                         t2 = g.add("transpose", args="clock")
                         last.link_to(t1); t1.link_to(t2); last = t2
 
-                expand_args = ""                          # convert TV->PC range before downscale if requested
+                # expand TV->PC range before final downscale if requested
+                expand_args = ""
                 if expand_mode == 2:
                     expand_args = ":in_range=tv:out_range=pc"
                 elif expand_mode == 1:
                     expand_args = ":in_range=auto:out_range=pc"
 
-                n = g.add("scale", args=f"{TW}:{TH}:flags=bilinear:force_original_aspect_ratio=decrease" + expand_args)
-                last.link_to(n); last = n
-                n = g.add("pad", args=f"{TW}:{TH}:(ow-iw)/2:(oh-ih)/2:color=black")
-                last.link_to(n); last = n
+                # Fit selection
+                fit_mode = str(CONFIG.get("video", {}).get("fit", "auto-cover")).lower()
+                if fit_mode in ("cover", "auto-cover"):
+                    n = g.add("scale", args=f"{TW}:{TH}:flags=bilinear:force_original_aspect_ratio=increase" + expand_args)
+                    last.link_to(n); last = n
+                    n = g.add("crop", args=f"{TW}:{TH}:(in_w-{TW})/2:(in_h-{TH})/2")
+                    last.link_to(n); last = n
+                else:
+                    n = g.add("scale", args=f"{TW}:{TH}:flags=bilinear:force_original_aspect_ratio=decrease" + expand_args)
+                    last.link_to(n); last = n
+                    n = g.add("pad", args=f"{TW}:{TH}:(ow-iw)/2:(oh-ih)/2:color=black")
+                    last.link_to(n); last = n
 
-                n = g.add("setdar", args="1")             # keep final DAR square
+                n = g.add("setdar", args="1")
                 last.link_to(n); last = n
-                n = g.add("format", args="rgb24")         # convert to RGB for DDP
+                n = g.add("format", args="rgb24")
                 last.link_to(n); last = n
 
                 sink = g.add("buffersink")
@@ -716,6 +793,33 @@ def _iter_frames_pyav(
                 # decode() may return 0..N frames (depending on codec & B-frames)
                 frames = packet.decode()
                 for frame in frames:
+                    # --- Auto-crop sampling on early frames (before building graph) ---
+                    if ac_enabled and not ac_decided and ac_seen < ac_probe_frames:
+                        try:
+                            gray = frame.to_ndarray(format="gray")
+                            cand = _estimate_black_bars(frame.width, frame.height, gray,
+                                                        ac_thresh, ac_min_px, ac_max_ratio)
+                            # Adjust for rotation metadata: detector looked at pre-rotate coords,
+                            # but we crop pre-rotate; remap by rotation so L/R/T/B stay correct.
+                            r = _rotation_from_stream_and_frame(vstream, frame)
+                            if r == 90:
+                                cand = {"l": cand["t"], "r": cand["b"], "t": cand["r"], "b": cand["l"]}
+                            elif r == 270:
+                                cand = {"l": cand["b"], "r": cand["t"], "t": cand["l"], "b": cand["r"]}
+                            elif r == 180:
+                                cand = {"l": cand["r"], "r": cand["l"], "t": cand["b"], "b": cand["t"]}
+                            for k in ("l", "r", "t", "b"):
+                                ac_samples[k].append(int(cand[k]))
+                        except Exception:
+                            pass
+                        finally:
+                            ac_seen += 1
+                            if ac_seen >= ac_probe_frames:
+                                import statistics as _st
+                                ac_crop = {k: int(_st.median(v) if v else 0) for k, v in ac_samples.items()}
+                                ac_decided = True
+                                # Force a rebuild next frame to apply crop
+                                graph = None
                     _ensure_graph_for(frame)
                     src_in.push(frame)  # type: ignore[name-defined]
 
