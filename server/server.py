@@ -6,6 +6,15 @@ server.py
 - WebSocket control at /control (JSON messages: hello, start_stream, update, stop_stream, ping)
 - Sends full RGB888 frames via DDP (UDP/4048). One frame = multiple <=1440B packets.
 - pace=Hz up-samples only (duplicates). If pace==0 or omitted, native cadence is used.
+
+Notes on DDP packet format used here (network byte order):
+  flags (1): bit6=DDP (0x40), bit0=PUSH (set on last packet of a frame)
+  seq   (1): 0..255 (we locally wrap 0..15 to match common DDP practice)
+  pix   (1): 0x2C (RGB, 8 bpc)
+  out   (1): output id (0..255)
+  off   (4): byte offset in the full frame payload (RGB888 byte space)
+  len   (2): payload bytes in this packet (<= 1440)
+We keep UDP payload <=1440 for safety on 1500-byte MTU links.
 """
 
 import asyncio
@@ -47,6 +56,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "net": {"win_timer_res": True}
 }
 
+# -------------------------
+# Config helpers
+# -------------------------
+
 def _load_config_file(path: str) -> Dict[str, Any]:
     ext = os.path.splitext(path)[1].lower()
     if not os.path.exists(path):
@@ -81,6 +94,7 @@ def _load_config_file(path: str) -> Dict[str, Any]:
         print(f"[config] Failed to load {path}: {e}")
         return {}
 
+
 def _deep_update(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
     for k, v in src.items():
         if isinstance(v, dict) and isinstance(dst.get(k), dict):
@@ -88,6 +102,7 @@ def _deep_update(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
         else:
             dst[k] = v
     return dst
+
 
 def load_config(path: Optional[str]) -> Dict[str, Any]:
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
@@ -99,6 +114,11 @@ def load_config(path: Optional[str]) -> Dict[str, Any]:
             _deep_update(cfg, _load_config_file(auto))
     return cfg
 
+
+# -------------------------
+# Parsing / small utilities
+# -------------------------
+
 def _resolve_local_path(srcu: str) -> Optional[str]:
     u = urlparse(srcu)
     if u.scheme in ("", "file"):
@@ -108,21 +128,27 @@ def _resolve_local_path(srcu: str) -> Optional[str]:
         return url2pathname(p)
     return None
 
+
 def _truthy(s: str) -> bool:
     return s.lower() not in ("0", "false", "no", "off", "")
 
+
 async def _ws_send(ws, obj) -> bool:
-    """Best-effort send; returns False if socket is gone."""
+    """Best-effort JSON send; returns False if the socket is already closed.
+    Keeps error handling consistent and avoids raising into the control loop on disconnects.
+    """
     try:
         await ws.send(json.dumps(obj, separators=(",", ":")))
         return True
     except (ConnectionClosed, OSError):
         return False
 
+
 def _require_fields(msg, fields, verb):
     missing = [f for f in fields if f not in msg]
     if missing:
         raise ValueError(f"{verb} requires {', '.join(fields)} (missing: {', '.join(missing)})")
+
 
 def _ffmpeg_has_hwaccel(name: str) -> bool:
     exe = shutil.which("ffmpeg")
@@ -133,6 +159,7 @@ def _ffmpeg_has_hwaccel(name: str) -> bool:
         return any(line.strip().lower() == name.lower() for line in out.splitlines())
     except Exception:
         return False
+
 
 def pick_hw_backend(prefer: str | None = None) -> tuple[Optional[str], dict]:
     sys = platform.system().lower()
@@ -156,6 +183,11 @@ def pick_hw_backend(prefer: str | None = None) -> tuple[Optional[str], dict]:
     if ok("cuda"): return "cuda", {}
     return None, {}
 
+
+# -------------------------
+# Imaging helpers
+# -------------------------
+
 def _resize_pad_to_rgb_bytes(img: Image.Image, size: Tuple[int, int]) -> bytes:
     w, h = size
     if img.mode != "RGB":
@@ -171,6 +203,7 @@ def _resize_pad_to_rgb_bytes(img: Image.Image, size: Tuple[int, int]) -> bytes:
         im = canvas
     return np.asarray(im, dtype=np.uint8).tobytes()
 
+
 def _apply_rotation_rgb_array(arr: np.ndarray, rotate_deg: int) -> np.ndarray:
     if rotate_deg % 360 == 0:
         return arr
@@ -179,6 +212,7 @@ def _apply_rotation_rgb_array(arr: np.ndarray, rotate_deg: int) -> np.ndarray:
     if k == 2: return np.rot90(arr, 2)
     if k == 3: return np.rot90(arr, 3)
     return arr
+
 
 def _rotation_from_stream_and_frame(vstream, frame) -> int:
     try:
@@ -197,7 +231,16 @@ def _rotation_from_stream_and_frame(vstream, frame) -> int:
         pass
     return 0
 
+
+# -------------------------
+# Frame iteration
+# -------------------------
+
 def _iter_frames_imageio(srcu: str, size: Tuple[int, int], loop_video: bool):
+    """Image/still/animated-GIF path using imageio.
+    We try to infer native frame delay from container if present; otherwise
+    we derive it from FPS (if available) with a floor of MIN_DELAY_MS.
+    """
     default_delay_ms = 100
     try:
         props = iio.improps(srcu)
@@ -238,6 +281,7 @@ def _iter_frames_imageio(srcu: str, size: Tuple[int, int], loop_video: bool):
         if not loop_video:
             break
 
+
 def _open_with_hwaccel(srcu: str, prefer: str | None):
     if not _HAVE_PYAV:
         return av.open(srcu, mode="r"), None, None  # type: ignore
@@ -258,8 +302,14 @@ def _open_with_hwaccel(srcu: str, prefer: str | None):
         print(f"[hwaccel disabled: {kind} not available: {e}]")
         return container, vstream, None
 
+
 def _iter_frames_pyav(srcu: str, size: Tuple[int, int], loop_video: bool,
                       *, expand_mode: int, hw_prefer: str | None):
+    """Video path using PyAV.
+    - Limited-range expansion (MPEG) maps 16..235 -> 0..255 when enabled (auto/force).
+    - Rotation metadata is honored before scaling.
+    - Inter-frame delay is derived from PTS deltas when available; otherwise from average_rate.
+    """
     while True:
         try:
             container, vstream, dec = _open_with_hwaccel(srcu, hw_prefer)
@@ -334,8 +384,10 @@ def _iter_frames_pyav(srcu: str, size: Tuple[int, int], loop_video: bool,
         if not loop_video:
             break
 
+
 def iter_frames(src: str, size: Tuple[int, int], loop_video: bool = True,
                 *, expand_mode: int, hw_prefer: str | None):
+    """Choose PyAV for videos, imageio for images/GIFs."""
     srcu = unquote(src)
     low = srcu.lower()
     if _HAVE_PYAV and not any(low.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif")):
@@ -343,48 +395,83 @@ def iter_frames(src: str, size: Tuple[int, int], loop_video: bool = True,
     else:
         yield from _iter_frames_imageio(srcu, size, loop_video)
 
+
+# -------------------------
+# DDP sender (optimized)
+# -------------------------
+
+_DDP_MAX_DATA = 1440                                  # payload bytes per packet
+_DDP_HDR = struct.Struct("!BBB B I H")                # 10-byte header
+_DDP_PIXEL_CFG_RGB888 = 0x2C                          # RGB 8bpc
+
+
 def ddp_send_frame(sock, addr, rgb_bytes: bytes, output_id: int, seq: int):
-    MAX_DATA = 1440
+    """Chunk a full RGB888 frame into DDP packets using a single reusable buffer.
+
+    Header layout (network byte order):
+      flags (1): bit6=DDP, bit0=PUSH (set on last packet)
+      seq   (1): 0..255 (we wrap 0..15 higher up to match DDP's 4-bit habit)
+      pix   (1): 0x2C (RGB, 8bpc)
+      out   (1): output id (0..255)
+      off   (4): byte offset in full frame
+      len   (2): data bytes in this packet (<= 1440)
+    """
+    mv = memoryview(rgb_bytes)
+    total = len(mv)
     off = 0
-    total = len(rgb_bytes)
+    push_mask = 0x01
+    ddp_base_flags = 0x40  # DDP
+
+    # One small buffer to build each packet: header(10) + payload(<=1440)
+    pkt = bytearray(_DDP_HDR.size + _DDP_MAX_DATA)
+
     while off < total:
-        chunk = rgb_bytes[off: off + MAX_DATA]
-        push = 0x01 if (off + len(chunk) >= total) else 0x00
-        flags = 0x40 | push
-        pixcfg = 0x2C  # RGB, 8bpc
-        hdr = struct.pack("!BBB B I H",
-                          flags,
-                          seq & 0xFF,
-                          pixcfg,
-                          output_id & 0xFF,
-                          off,
-                          len(chunk))
-        sock.sendto(hdr + chunk, addr)
+        chunk = mv[off: off + _DDP_MAX_DATA]
+        is_last = (off + len(chunk) >= total)
+        flags = ddp_base_flags | (push_mask if is_last else 0)
+
+        _DDP_HDR.pack_into(pkt, 0,
+            flags,
+            seq & 0xFF,
+            _DDP_PIXEL_CFG_RGB888,
+            output_id & 0xFF,
+            off,
+            len(chunk)
+        )
+        pkt[_DDP_HDR.size : _DDP_HDR.size + len(chunk)] = chunk
+
+        sock.sendto(pkt[:_DDP_HDR.size + len(chunk)], addr)
         off += len(chunk)
+
 
 # -------------------------
 # Paced sender (upsample)
 # -------------------------
 async def _paced_sender(sock, addr, output_id, *, pace_hz, ema_alpha, get_latest_bytes):
-    """Send at fixed rate, using latest bytes supplier. Returns when cancelled."""
+    """Send at fixed rate, using latest bytes supplier. Returns when cancelled.
+    EMA is computed in float32 to avoid repeated dtype churn; we cast to uint8 only on transmit.
+    """
     loop_ = asyncio.get_running_loop()
     next_tick = loop_.time()
     seq = 0
     tick_s = 1.0 / pace_hz
-    ema_buf: Optional[np.ndarray] = None
+    ema_buf: Optional[np.ndarray] = None  # float32 accumulator
 
     while True:
         latest = get_latest_bytes()
         if latest is not None:
-            payload = latest
             if ema_alpha > 0.0:
                 cur = np.frombuffer(latest, dtype=np.uint8)
                 if ema_buf is None or ema_buf.shape != cur.shape:
-                    ema_buf = cur.copy()
+                    ema_buf = cur.astype(np.float32, copy=True)
                 else:
-                    ema_buf = (ema_buf.astype(np.float32) * (1.0 - ema_alpha) +
-                               cur.astype(np.float32) * ema_alpha).astype(np.uint8)
-                payload = ema_buf.tobytes()
+                    # ema_buf = ema_buf*(1-a) + cur*a
+                    ema_buf *= (1.0 - ema_alpha)
+                    ema_buf += cur.astype(np.float32) * ema_alpha
+                payload = ema_buf.astype(np.uint8, copy=False).tobytes()
+            else:
+                payload = latest
+
             ddp_send_frame(sock, addr, payload, output_id, seq)
             seq = (seq + 1) & 0x0F
 
@@ -393,18 +480,18 @@ async def _paced_sender(sock, addr, output_id, *, pace_hz, ema_alpha, get_latest
         if sleep_for > 0:
             await asyncio.sleep(sleep_for)
 
+
 # -------------------------
 # Main task per connection
 # -------------------------
 async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, opts):
     """If pace_hz>0: run producer (native cadence) + paced sender (fixed Hz).
-       Else: single native-cadence loop (what worked for you)."""
+       Else: single native-cadence loop (what worked for you).
+
+       Note: src path validation happens in start_stream(); we avoid repeating it here.
+    """
     import socket
     w, h = size
-    srcu = unquote(src)
-    local_path = _resolve_local_path(srcu)
-    if local_path is not None and not os.path.exists(local_path):
-        raise FileNotFoundError(f"no such file: {local_path}")
 
     frames = iter_frames(
         src, (w, h),
@@ -418,7 +505,6 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
 
     pace_hz   = int(opts.get("pace_hz", 0))
     ema_alpha = float(opts.get("ema_alpha", 0.0))
-    log_send  = bool(opts.get("log_send_ms", False))
 
     try:
         if pace_hz > 0:
@@ -465,16 +551,43 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
     finally:
         sock.close()
 
+
 # =========================
 # WebSocket control
 # =========================
 CONFIG: Dict[str, Any] = DEFAULT_CONFIG
+
 
 def _is_benign_disconnect(exc: BaseException) -> bool:
     # Windows common transient network errors
     if isinstance(exc, OSError) and getattr(exc, "winerror", None) in (64, 121):
         return True
     return isinstance(exc, (ConnectionClosedOK, ConnectionClosedError))
+
+
+# Small parse helpers for readability
+
+def _parse_expand(val, default):
+    s = str(val if val is not None else default).lower()
+    if s in ("2", "force"):  return 2
+    if s in ("0", "false", "never"): return 0
+    return 1  # auto
+
+
+def _parse_hw(val, default):
+    s = (val if val is not None else default)
+    return None if str(s).lower() in ("none","off","cpu") else str(s)
+
+
+def _parse_pace_hz(v):
+    try:
+        n = int(v or 0)
+    except Exception:
+        raise ValueError(f"pace must be integer Hz (got {v!r})")
+    if n < 0:
+        raise ValueError("pace must be >= 0")
+    return n
+
 
 async def handle_control(ws):
     """
@@ -511,19 +624,11 @@ async def handle_control(ws):
         src = str(msg["src"])
         ddp_port = int(msg.get("ddp_port", 4048))
 
-        pace_val = msg.get("pace", 0)
-        try:
-            pace_hz = int(pace_val)
-        except Exception:
-            raise ValueError(f"pace must be integer Hz (got {pace_val!r})")
-        if pace_hz < 0:
-            raise ValueError("pace must be >= 0")
-
+        pace_hz = _parse_pace_hz(msg.get("pace", 0))
         opts = {
             "loop": _truthy(str(msg.get("loop", CONFIG["playback"]["loop"]))),
-            "expand_mode": 2 if str(msg.get("expand", CONFIG["video"]["expand_mode"])) in ("2","force")
-                            else (1 if str(msg.get("expand", CONFIG["video"]["expand_mode"])) not in ("0","false","never") else 0),
-            "hw": (None if str(msg.get("hw", CONFIG["hw"]["prefer"])).lower() in ("none","off","cpu") else str(msg.get("hw", CONFIG["hw"]["prefer"]))),
+            "expand_mode": _parse_expand(msg.get("expand"), CONFIG["video"]["expand_mode"]),
+            "hw": _parse_hw(msg.get("hw"), CONFIG["hw"]["prefer"]),
             "log_send_ms": bool(CONFIG["log"].get("send_ms", False)),
             "pace_hz": pace_hz,
             "ema_alpha": max(0.0, min(float(msg.get("ema", 0.0)), 1.0)),
@@ -533,6 +638,7 @@ async def handle_control(ws):
         srcu = unquote(src)
         local_path = _resolve_local_path(srcu)
         if local_path is not None and not os.path.exists(local_path):
+            print(f"* start_stream {session['ip']} dev={session['device_id']} out={out} requested missing file: {local_path}")
             raise FileNotFoundError(f"no such file: {local_path}")
 
         # stop any existing task for this out (serialized)
@@ -647,6 +753,7 @@ async def handle_control(ws):
                 if streams:
                     await asyncio.gather(*streams.values(), return_exceptions=True)
 
+
 async def dispatch(ws):
     path = getattr(getattr(ws, "request", None), "path", "/")
     try:
@@ -661,6 +768,7 @@ async def dispatch(ws):
         with contextlib.suppress(Exception):
             await ws.close()
 
+
 def _win_timer_res(enable=True):
     if os.name == "nt":
         try:
@@ -671,6 +779,7 @@ def _win_timer_res(enable=True):
                 ctypes.windll.winmm.timeEndPeriod(1)
         except Exception as e:
             print(f"[warn] timeBeginPeriod/timeEndPeriod failed: {e}")
+
 
 async def main():
     import argparse
@@ -684,23 +793,26 @@ async def main():
     CONFIG = load_config(args.config)
     print(f"* loaded config: {CONFIG}")
 
-    print("* ws_ddp_proxy on ws://{}:{}/control  (protocol: hello, start_stream, update, stop_stream, ping/pong)".format(args.host, args.port))
-    async with websockets.serve(
-        dispatch, args.host, args.port,
-        max_size=2**22,
-        compression=None,
-        ping_interval=20, ping_timeout=20,
-        close_timeout=1.0
-    ):
-        await asyncio.Future()
+    try:
+        if bool(CONFIG["net"].get("win_timer_res", True)):
+            _win_timer_res(True)
+
+        print("* ws_ddp_proxy on ws://{}:{}/control  (protocol: hello, start_stream, update, stop_stream, ping/pong)".format(args.host, args.port))
+        async with websockets.serve(
+            dispatch, args.host, args.port,
+            max_size=2**22,
+            compression=None,
+            ping_interval=20, ping_timeout=20,
+            close_timeout=1.0
+        ):
+            await asyncio.Future()
+    finally:
+        if bool(CONFIG["net"].get("win_timer_res", True)):
+            _win_timer_res(False)
+
 
 if __name__ == "__main__":
     try:
-        if bool(DEFAULT_CONFIG["net"]["win_timer_res"]):
-            _win_timer_res(True)
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
-    finally:
-        if bool(DEFAULT_CONFIG["net"]["win_timer_res"]):
-            _win_timer_res(False)
