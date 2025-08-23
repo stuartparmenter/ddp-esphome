@@ -6,6 +6,7 @@ pillow>=10,<13
 psutil>=5,<8
 PyYAML>=6,<7
 websockets>=12,<16
+yt-dlp>=2024.10,<2026
 
 # Optional perf (POSIX only)
 uvloop>=0.19 ; platform_system!="Windows"

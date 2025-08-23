@@ -31,6 +31,9 @@ import av
 from av.filter import Graph as AvFilterGraph
 av.logging.set_level(av.logging.INFO)
 
+# --- YouTube resolver (required) ---
+import yt_dlp  # type: ignore
+
 
 # -------------------------
 # Metrics helpers
@@ -256,6 +259,80 @@ def pick_hw_backend(prefer: Optional[str] = None):
     return (None, {})
 
 
+# --- YouTube helpers ---
+
+def _is_youtube_url(u: str) -> bool:
+    try:
+        p = urlparse(u)
+        host = (p.netloc or "").lower()
+        return any(h in host for h in (
+            "youtube.com", "youtu.be", "youtube-nocookie.com"
+        ))
+    except Exception:
+        return False
+
+
+def _headers_dict_to_ffmpeg_opt(h: Dict[str, str]) -> str:
+    """
+    FFmpeg's libavformat expects a single CRLF-delimited string in the `headers`
+    option (same as `-headers` in ffmpeg CLI). Must end with a trailing CRLF.
+    """
+    if not h:
+        return ""
+    lines = []
+    for k, v in h.items():
+        if not k or v is None:
+            continue
+        k = str(k).strip()
+        v = str(v).strip()
+        if k and v:
+            lines.append(f"{k}: {v}")
+    return "\r\n".join(lines) + "\r\n"  # avoid "No trailing CRLF" warning
+
+
+def _resolve_stream_url(srcu: str) -> tuple[str, Dict[str, str]]:
+    """
+    Resolve YouTube (and similar) page URLs into a direct media URL + HTTP headers
+    suitable for av.open(..., options={ 'headers': 'K: V\\r\\n...' }).
+    Non-YouTube URLs are returned unchanged.
+    """
+    if not _is_youtube_url(srcu):
+        return srcu, {}
+
+    # Prefer compact, HTTP progressive when possible; fall back to HLS/DASH
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "extract_flat": False,
+        "format": (
+            "best[protocol^=http][vcodec!=none][height<=720]/"
+            "best[protocol*=m3u8][vcodec!=none][height<=720]/"
+            "bv*[height<=720]/best"
+        ),
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(srcu, download=False)
+        if info is None:
+            return srcu, {}
+        if "entries" in info and info["entries"]:
+            info = info["entries"][0]
+        media_url = info.get("url") or srcu
+        headers = {}
+        rh = info.get("http_headers") or {}
+        if not rh and "formats" in info and isinstance(info["formats"], list):
+            for f in info["formats"]:
+                if f.get("url") == media_url and f.get("http_headers"):
+                    rh = f["http_headers"]
+                    break
+        if rh:
+            headers_str = _headers_dict_to_ffmpeg_opt({k: v for k, v in rh.items()})
+            if headers_str:
+                headers["headers"] = headers_str
+        return media_url, headers
+
+
 # -------------------------
 # Imaging helpers
 # -------------------------
@@ -341,26 +418,27 @@ def _iter_frames_imageio(srcu: str, size: tuple[int, int], loop_video: bool):
             break
 
 
-def _open_with_hwaccel(srcu: str, prefer: Optional[str]):
+def _open_with_hwaccel(srcu: str, prefer: Optional[str], options: Optional[Dict[str, str]] = None):
     kind, _kw = pick_hw_backend(prefer)
+    options = options or {}
     try:
         if kind:
             try:
                 from av.codec.hwaccel import HWAccel
             except Exception as ie:
                 raise RuntimeError(f"hwaccel API unavailable: {ie}")
-            container = av.open(srcu, mode="r", hwaccel=HWAccel(device_type=kind))
+            container = av.open(srcu, mode="r", hwaccel=HWAccel(device_type=kind), options=options)
             print(f"[hw] selected {kind} for decode")
         else:
             print("[hw] using CPU decode (no HW accel selected)")
-            container = av.open(srcu, mode="r")
+            container = av.open(srcu, mode="r", options=options)
         vstream = next((s for s in container.streams if s.type == "video"), None)
         if vstream is None:
             raise RuntimeError("no video stream")
         return container, vstream
     except Exception as e:
         print(f"[hwaccel disabled: {kind or 'auto'} not available: {e}]")
-        container = av.open(srcu, mode="r")
+        container = av.open(srcu, mode="r", options=options)
         vstream = next((s for s in container.streams if s.type == "video"), None)
         if vstream is None:
             raise RuntimeError("no video stream")
@@ -384,6 +462,12 @@ def _choose_decode_preference(
     if prefer and str(prefer).lower() not in ("", "auto"):
         print(f"[decode] prefer={prefer!r} explicitly requested -> honoring")
         return prefer
+
+    # If this is a YouTube page URL, we will resolve to HLS/DASH; skip probing and choose auto.
+    if _is_youtube_url(srcu):
+        kind, _ = pick_hw_backend("auto")
+        print(f"[decode] source=YouTube page -> choosing HW 'auto' (resolved stream likely HLS/DASH); auto maps to {kind or 'none'}")
+        return "auto"
 
     TW, TH = out_size
 
@@ -458,38 +542,34 @@ def _iter_frames_pyav(
     expand_mode: int,
     hw_prefer: Optional[str]
 ):
+    """
+    PyAV video path with a REBUILDABLE filter graph.
+
+    Why rebuild? HLS/DASH (e.g., YouTube) can change width/height/pix_fmt/SAR/rotation mid-play.
+    A fixed filter graph gets confused and you see "48px wide inside 64" artifacts.
+    We detect changes and rebuild the graph on the next frame.
+    """
     TW, TH = size
 
-    def _tb_num_den(tb) -> tuple[int, int]:
-        if tb is None:
-            return (1, 1000)
-        n = getattr(tb, "num", None)
-        d = getattr(tb, "den", None)
-        if n is not None and d is not None:
-            return int(n), int(d)
-        n = getattr(tb, "numerator", None)
-        d = getattr(tb, "denominator", None)
-        if n is not None and d is not None:
-            return int(n), int(d)
-        try:
-            n, d = tb
-            return int(n), int(d)
-        except Exception:
-            return (1, 1000)
+    # Resolve YouTube page URLs to direct media + headers
+    real_srcu, http_opts = _resolve_stream_url(srcu)
 
     try:
         from av.error import BlockingIOError as AvBlockingIOError  # type: ignore
     except Exception:
         AvBlockingIOError = None  # type: ignore
 
+    first_graph_log_done = False
+
     while True:
         try:
-            # Decide CPU vs HW based on input size/fps/codec; still routed through pick_hw_backend
-            prefer = _choose_decode_preference(srcu, hw_prefer, (TW, TH), expand_mode)
-            container, vstream = _open_with_hwaccel(srcu, prefer)
+            # Decide CPU vs HW based on input size/fps/codec (still routed through pick_hw_backend)
+            prefer = _choose_decode_preference(real_srcu, hw_prefer, (TW, TH), expand_mode)
+            container, vstream = _open_with_hwaccel(real_srcu, prefer, options=http_opts)
             if vstream is None:
                 raise RuntimeError("no video stream")
 
+            # Default frame delay if timestamps are missing
             avg_ms: Optional[float] = None
             if vstream.average_rate:
                 try:
@@ -499,53 +579,128 @@ def _iter_frames_pyav(
                 except Exception:
                     pass
 
+            # --- Rebuildable filter graph state ---
             graph = None
             src_in = sink_out = None
+            g_props = {"w": None, "h": None, "fmt": None, "sar": (1, 1), "rot": 0}
+
+            # Helpers
+            def _tb_num_den(tb) -> tuple[int, int]:
+                if tb is None:
+                    return (1, 1000)
+                for a, b in (("num", "den"), ("numerator", "denominator")):
+                    n = getattr(tb, a, None); d = getattr(tb, b, None)
+                    if n is not None and d is not None:
+                        return int(n), int(d)
+                try:
+                    n, d = tb
+                    return int(n), int(d)
+                except Exception:
+                    return (1, 1000)
+
+            def _sar_of(obj) -> tuple[int, int]:
+                # Try frame SAR first; fall back to codec_context SAR; else 1:1
+                try:
+                    sar = getattr(obj, "sample_aspect_ratio", None)
+                    n = getattr(sar, "num", getattr(sar, "numerator", None))
+                    d = getattr(sar, "den", getattr(sar, "denominator", None))
+                    if n and d and n > 0 and d > 0:
+                        return int(n), int(d)
+                except Exception:
+                    pass
+                try:
+                    cc = getattr(vstream, "codec_context", None)
+                    sar = getattr(cc, "sample_aspect_ratio", None)
+                    n = getattr(sar, "num", getattr(sar, "numerator", None))
+                    d = getattr(sar, "den", getattr(sar, "denominator", None))
+                    if n and d and n > 0 and d > 0:
+                        return int(n), int(d)
+                except Exception:
+                    pass
+                return (1, 1)
 
             def _ensure_graph_for(frame) -> None:
-                nonlocal graph, src_in, sink_out
-                if graph is not None:
+                """(Re)build the filter graph if geometry/SAR/format/rotation changed."""
+                nonlocal graph, src_in, sink_out, first_graph_log_done, g_props
+
+                w, h = int(frame.width), int(frame.height)
+                fmt_name = getattr(frame.format, "name", "rgb24")
+                sar_n, sar_d = _sar_of(frame)
+                rot = _rotation_from_stream_and_frame(vstream, frame)
+
+                need_rebuild = (
+                    graph is None or
+                    g_props["w"] != w or
+                    g_props["h"] != h or
+                    g_props["fmt"] != fmt_name or
+                    g_props["sar"] != (sar_n, sar_d) or
+                    g_props["rot"] != rot
+                )
+                if not need_rebuild:
                     return
+
+                old = g_props.copy()
+                g_props.update({"w": w, "h": h, "fmt": fmt_name, "sar": (sar_n, sar_d), "rot": rot})
+                print(f"[graph] rebuild: {old} -> {g_props}")
+
+                if not first_graph_log_done:
+                    try:
+                        cc = getattr(vstream, "codec_context", None)
+                        in_sar = getattr(cc, "sample_aspect_ratio", None)
+                        print(f"[graph] input codec SAR={in_sar} size={w}x{h}")
+                    except Exception:
+                        pass
+                    first_graph_log_done = True
 
                 g = AvFilterGraph()
 
                 tb_n, tb_d = _tb_num_den(frame.time_base or vstream.time_base)
                 fr_n, fr_d = _tb_num_den(getattr(vstream, "average_rate", None))
                 rate_arg = f":frame_rate={fr_n}/{fr_d}" if (fr_n and fr_d) else ""
+
+                # buffersrc with *actual* SAR; we normalize to square pixels later
                 src = g.add(
                     "buffer",
                     args=(
-                        f"video_size={frame.width}x{frame.height}:"
-                        f"pix_fmt={getattr(frame.format, 'name', 'rgb24')}:"
+                        f"video_size={w}x{h}:"
+                        f"pix_fmt={fmt_name}:"
                         f"time_base={tb_n}/{tb_d}:"
-                        f"pixel_aspect=1/1" + rate_arg
+                        f"pixel_aspect={sar_n}/{sar_d}" + rate_arg
                     ),
                 )
                 last = src
 
-                rot = _rotation_from_stream_and_frame(vstream, frame)
-                if rot in (90, 180, 270):
+                # --- Graph: unsqueeze PAR -> setsar=1 -> rotate -> scale+pad -> setdar=1 -> rgb24 ---
+                n = g.add("scale", args="iw*sar:ih")      # unsqueeze PAR into geometry
+                last.link_to(n); last = n
+                n = g.add("setsar", args="1")             # enforce square pixels from here on
+                last.link_to(n); last = n
+
+                if rot in (90, 180, 270):                 # correct rotation metadata
                     if rot == 90:
-                        t = g.add("transpose", args="clock"); last.link_to(t); last = t
+                        n = g.add("transpose", args="clock"); last.link_to(n); last = n
                     elif rot == 270:
-                        t = g.add("transpose", args="cclock"); last.link_to(t); last = t
+                        n = g.add("transpose", args="cclock"); last.link_to(n); last = n
                     else:  # 180
                         t1 = g.add("transpose", args="clock")
                         t2 = g.add("transpose", args="clock")
                         last.link_to(t1); t1.link_to(t2); last = t2
 
-                expand_args = ""
+                expand_args = ""                          # convert TV->PC range before downscale if requested
                 if expand_mode == 2:
                     expand_args = ":in_range=tv:out_range=pc"
                 elif expand_mode == 1:
                     expand_args = ":in_range=auto:out_range=pc"
-                sc = g.add("scale", args=f"{TW}:{TH}:flags=bilinear:force_original_aspect_ratio=decrease" + expand_args)
-                last.link_to(sc); last = sc
-                pd = g.add("pad", args=f"{TW}:{TH}:(ow-iw)/2:(oh-ih)/2:color=black")
-                last.link_to(pd); last = pd
 
-                fmt = g.add("format", args="rgb24")
-                last.link_to(fmt); last = fmt
+                n = g.add("scale", args=f"{TW}:{TH}:flags=bilinear:force_original_aspect_ratio=decrease" + expand_args)
+                last.link_to(n); last = n
+                n = g.add("pad", args=f"{TW}:{TH}:(ow-iw)/2:(oh-ih)/2:color=black")
+                last.link_to(n); last = n
+
+                n = g.add("setdar", args="1")             # keep final DAR square
+                last.link_to(n); last = n
+                n = g.add("format", args="rgb24")         # convert to RGB for DDP
+                last.link_to(n); last = n
 
                 sink = g.add("buffersink")
                 last.link_to(sink)
@@ -558,11 +713,13 @@ def _iter_frames_pyav(
             last_pts_s: Optional[float] = None
 
             for packet in container.demux(vstream):
+                # decode() may return 0..N frames (depending on codec & B-frames)
                 frames = packet.decode()
                 for frame in frames:
                     _ensure_graph_for(frame)
                     src_in.push(frame)  # type: ignore[name-defined]
 
+                    # Pull 0..N filtered frames
                     out_frames = []
                     while True:
                         try:
@@ -579,6 +736,7 @@ def _iter_frames_pyav(
                     for of in out_frames:
                         rgb888 = of.to_ndarray(format="rgb24").tobytes()
 
+                        # Compute inter-frame delay using PTS if available; otherwise avg_ms fallback
                         delay_ms: float = float(avg_ms) if (avg_ms is not None) else 1000.0 / 10.0
                         pts_s = None
                         if of.pts is not None:
@@ -645,17 +803,16 @@ _DDP_MAX_DATA = 1440
 #   out_id: destination output/canvas id (0..255)
 #   offset: byte offset within the frame buffer
 #   length: payload bytes in this packet
-_DDP_HDR = struct.Struct("!BBB B I H")  # flags, seq, cfg, out_id, offset, length
+_DDP_HDR = struct.Struct("!BBB B I H")  # flags, seq, cfg, out_id, offset, length (network byte order)
 _DDP_PIXEL_CFG_RGB888 = 0x2C
 
 
 def _ddp_iter_packets(rgb_bytes: bytes, output_id: int, seq: int):
-    """Yield complete DDP packets for a frame."""
     mv = memoryview(rgb_bytes)
     total = len(mv)
     off = 0
     push_mask = 0x01
-    ddp_base_flags = 0x40  # header present
+    ddp_base_flags = 0x40  # header present (per DDP spec); we'll OR in PUSH (0x01) on the last packet of a frame
     while off < total:
         end = min(off + _DDP_MAX_DATA, total)
         chunk = mv[off:end]
@@ -754,6 +911,8 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
         q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=max_in_flight)
 
         async def drainer():
+            # Dedicated consumer for the UDP queue so producers never block on sendto().
+            # Keeps packet pacing accurate even if the NIC jitters.
             while True:
                 pkt = await q.get()
                 try:
@@ -801,6 +960,8 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
                     group_left = group_n
 
         if pace_hz > 0:
+            # --- Pacing path ---
+            # Producer decodes at source cadence, sampler emits at fixed pace_hz (optionally with EMA smoothing).
             # Pacing path (producer + sampler). EMA is applied in the sampler.
             latest: dict[str, Optional[bytes]] = {"buf": None}
             latest_lock = asyncio.Lock()
@@ -875,7 +1036,8 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
                     await pace_task
 
         else:
-            # Native cadence
+            # --- Native cadence ---
+            # Emit frames at the source-provided delay_ms without resampling.
             next_t = loop.time()
             for rgb888, delay_ms in frames:
                 delay_s = max(MIN_DELAY_MS/1000.0, float(delay_ms)/1000.0)

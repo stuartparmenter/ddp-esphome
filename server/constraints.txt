@@ -6,3 +6,4 @@ pillow==11.3.0
 psutil==7.0.0
 PyYAML==6.0.2
 websockets==15.0.1
+yt-dlp==2025.8.22
