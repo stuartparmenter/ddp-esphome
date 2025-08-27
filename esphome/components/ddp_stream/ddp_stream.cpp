@@ -355,6 +355,8 @@ void DdpStream::bind_if_possible_(Binding &b) {
   if (b.front_buf.empty() || b.ready_buf.empty() || b.accum_buf.empty()) return;
 
   canvas_set_buf_rgb565(b.canvas, b.front_buf.data(), b.w, b.h);
+  // Clear immediately to avoid first-show flash.
+  lv_canvas_fill_bg(b.canvas, lv_color_black(), LV_OPA_COVER);
 
   lv_obj_add_event_cb(b.canvas, &DdpStream::on_canvas_size_changed_, LV_EVENT_SIZE_CHANGED, this);
   b.bound = true;
