@@ -561,8 +561,6 @@ def _iter_frames_pyav(
     """
     TW, TH = size
 
-    # Resolve YouTube page URLs to direct media + headers
-    real_srcu, http_opts = _resolve_stream_url(srcu)
     # --- Auto-crop (black bar) config/state ---
     ac_cfg = CONFIG.get("video", {}).get("autocrop", {}) or {}
     ac_enabled = bool(ac_cfg.get("enabled", True))
@@ -616,6 +614,10 @@ def _iter_frames_pyav(
 
     while True:
         try:
+            # Resolve YouTube page URLs to fresh direct media + headers on each (re)open
+            # (googlevideo links expire; resolving here ensures we always reopen with a valid URL)
+            real_srcu, http_opts = _resolve_stream_url(srcu)
+
             # Decide CPU vs HW based on input size/fps/codec (still routed through pick_hw_backend)
             prefer = _choose_decode_preference(real_srcu, hw_prefer, (TW, TH), expand_mode)
             container, vstream = _open_with_hwaccel(real_srcu, prefer, options=http_opts)
@@ -870,6 +872,15 @@ def _iter_frames_pyav(
             msg = str(e).lower()
             if isinstance(e, FileNotFoundError) or "no such file" in msg or "not found" in msg:
                 raise FileNotFoundError(f"cannot open source: {srcu}") from e
+            # If the original source is a YouTube *page* URL, treat demux/open errors
+            # as transient: refresh the googlevideo URL on the next loop iteration.
+            if _is_youtube_url(srcu):
+                print(f"[retry] YouTube demux/open error; refreshing URL and retrying: {e!r}")
+                # 'container' may or may not be defined here; suppress either way.
+                with contextlib.suppress(Exception):
+                    container.close()
+                time.sleep(0.5)
+                continue
             raise RuntimeError(f"av error: {e}") from e
 
         if not loop_video:
