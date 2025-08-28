@@ -64,10 +64,11 @@ class DdpStream : public Component {
     lv_obj_t* canvas{nullptr};
     int w{-1}, h{-1};
 
-    // Triple buffering
-    std::vector<uint16_t> front_buf;     // currently displayed (RGB565)
-    std::vector<uint16_t> ready_buf;     // next to present (filled on PUSH)
-    std::vector<uint16_t> accum_buf;     // RX writes current frame here
+    // Triple buffering (RGB565), allocated via lv_mem_alloc (PSRAM-aware)
+    uint16_t* front_buf{nullptr};  // currently displayed (bound to canvas)
+    uint16_t* ready_buf{nullptr};  // next to present (filled on PUSH)
+    uint16_t* accum_buf{nullptr};  // RX writes current frame here
+    size_t    buf_px{0};           // buffer length in pixels (for all three)
     std::atomic<bool> have_ready{false}; // a frame is queued for present
 
 #if DDP_STREAM_METRICS
@@ -130,6 +131,7 @@ class DdpStream : public Component {
   void ensure_socket_();
   void open_socket_();
   void close_socket_();
+  void free_binding_buffers_(Binding &b, bool keep_front_bound);
 
   static void recv_task_trampoline(void* arg);
   void recv_task();
