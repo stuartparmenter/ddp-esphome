@@ -65,7 +65,7 @@ class DdpStream : public Component {
     int w{-1}, h{-1};
 
     // Triple buffering (RGB565), allocated via lv_mem_alloc (PSRAM-aware)
-    uint16_t* front_buf{nullptr};  // currently displayed (bound to canvas)
+    uint16_t* front_buf{nullptr};  // currently displayed (owned by the canvas)
     uint16_t* ready_buf{nullptr};  // next to present (filled on PUSH)
     uint16_t* accum_buf{nullptr};  // RX writes current frame here
     size_t    buf_px{0};           // buffer length in pixels (for all three)
@@ -131,13 +131,13 @@ class DdpStream : public Component {
   void ensure_socket_();
   void open_socket_();
   void close_socket_();
-  void free_binding_buffers_(Binding &b, bool keep_front_bound);
 
   static void recv_task_trampoline(void* arg);
   void recv_task();
 
   void bind_if_possible_(Binding &b);
   void ensure_binding_buffers_(Binding &b);
+  void free_ready_accum_(Binding &b);
   static void on_canvas_size_changed_(lv_event_t *e);
 
   Binding* find_binding_(uint8_t id);

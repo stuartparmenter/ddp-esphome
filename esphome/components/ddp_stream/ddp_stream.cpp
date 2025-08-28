@@ -6,6 +6,7 @@
 #include "esphome/components/network/util.h"
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include "esp_timer.h"
 #include <sys/time.h>
 
@@ -44,6 +45,23 @@ static inline double ewma(double prev, double sample, double alpha = 0.2) {
   return (prev == 0.0) ? sample : (alpha * sample + (1.0 - alpha) * prev);
 }
 #endif
+
+static const char* img_cf_name(uint8_t cf) {
+  switch (cf) {
+    case LV_IMG_CF_TRUE_COLOR:                  return "TRUE_COLOR";
+    case LV_IMG_CF_TRUE_COLOR_CHROMA_KEYED:     return "TRUE_COLOR_CK";
+    case LV_IMG_CF_TRUE_COLOR_ALPHA:            return "TRUE_COLOR_ALPHA";
+    case LV_IMG_CF_INDEXED_1BIT:                return "INDEXED_1BIT";
+    case LV_IMG_CF_INDEXED_2BIT:                return "INDEXED_2BIT";
+    case LV_IMG_CF_INDEXED_4BIT:                return "INDEXED_4BIT";
+    case LV_IMG_CF_INDEXED_8BIT:                return "INDEXED_8BIT";
+    case LV_IMG_CF_ALPHA_1BIT:                  return "ALPHA_1BIT";
+    case LV_IMG_CF_ALPHA_2BIT:                  return "ALPHA_2BIT";
+    case LV_IMG_CF_ALPHA_4BIT:                  return "ALPHA_4BIT";
+    case LV_IMG_CF_ALPHA_8BIT:                  return "ALPHA_8BIT";
+    default:                                    return "UNKNOWN";
+  }
+}
 
 // -------- public API --------
 
@@ -127,21 +145,15 @@ void DdpStream::loop() {
     if (!b.have_ready.exchange(false))
       continue;
 
-    if (!b.canvas || b.w <= 0 || b.h <= 0)
+    if (!b.canvas || b.buf_px == 0)
       continue;
 
-    const int w = b.w;
-    const int h = b.h;
+    // copy ready -> front using the actual buffer length in pixels
+    if (b.buf_px && b.front_buf && b.ready_buf) {
+      std::memcpy(b.front_buf, b.ready_buf, b.buf_px * sizeof(uint16_t));
+    }
 
-    // copy ready -> front (canvas is already bound to front_buf in bind_if_possible_)
-    std::memcpy(b.front_buf, b.ready_buf, (size_t)w * (size_t)h * sizeof(uint16_t));
-
-    // invalidate full canvas
-    lv_area_t a;
-    a.x1 = 0; a.y1 = 0;
-    a.x2 = static_cast<lv_coord_t>(w - 1);
-    a.y2 = static_cast<lv_coord_t>(h - 1);
-    lv_obj_invalidate_area(b.canvas, &a);
+    lv_obj_invalidate(b.canvas);
 
 #if DDP_STREAM_METRICS
     // queue wait time (ready -> present)
@@ -272,6 +284,11 @@ void DdpStream::close_socket_() {
   } else if (sock_ >= 0) {
     ::shutdown(sock_, SHUT_RDWR); ::close(sock_); sock_ = -1;
   }
+
+  for (auto &kv : bindings_) {
+    free_ready_accum_(kv.second);
+  }
+
   ESP_LOGI(TAG, "DDP socket closed");
 }
 
@@ -354,7 +371,6 @@ void DdpStream::bind_if_possible_(Binding &b) {
   ensure_binding_buffers_(b);
   if (!b.front_buf || !b.ready_buf || !b.accum_buf) return;
 
-  canvas_set_buf_rgb565(b.canvas, b.front_buf, b.w, b.h);
   // Clear immediately to avoid first-show flash.
   lv_canvas_fill_bg(b.canvas, lv_color_black(), LV_OPA_COVER);
 
@@ -363,32 +379,47 @@ void DdpStream::bind_if_possible_(Binding &b) {
 }
 
 void DdpStream::ensure_binding_buffers_(Binding &b) {
-  if (b.w <= 0 || b.h <= 0) return;
-  const size_t px = (size_t)b.w * (size_t)b.h;
-  if (b.buf_px == px && b.front_buf && b.ready_buf && b.accum_buf) return;
+  if (!b.canvas) return;
 
-  // if size changed, (optionally) keep the currently bound front buffer to avoid dangling LVGL ptr
-  bool keep_front_bound = b.bound && (b.buf_px != 0) && (b.front_buf != nullptr);
-  free_binding_buffers_(b, keep_front_bound);
-
-  // Allocate three buffers of px * sizeof(uint16_t)
-  size_t bytes = px * sizeof(uint16_t);
-  b.front_buf = static_cast<uint16_t*>(lv_mem_alloc(bytes));
-  b.ready_buf = static_cast<uint16_t*>(lv_mem_alloc(bytes));
-  b.accum_buf = static_cast<uint16_t*>(lv_mem_alloc(bytes));
-  if (!b.front_buf || !b.ready_buf || !b.accum_buf) {
-    ESP_LOGW(TAG, "lv_mem_alloc failed for %ux%u buffers", (unsigned)b.w, (unsigned)b.h);
-    // free any partial allocations
-    if (b.front_buf) lv_mem_free(b.front_buf), b.front_buf = nullptr;
-    if (b.ready_buf) lv_mem_free(b.ready_buf), b.ready_buf = nullptr;
-    if (b.accum_buf) lv_mem_free(b.accum_buf), b.accum_buf = nullptr;
-    b.buf_px = 0;
+  // 1) Adopt the canvas' existing buffer as our front (owned by LVGL canvas)
+  auto *img = (lv_img_dsc_t*) lv_canvas_get_img(b.canvas);
+  if (!img || !img->data || img->header.w <= 0 || img->header.h <= 0) {
+    // Canvas not fully initialized yet; try again later
     return;
   }
-  std::memset(b.front_buf, 0, bytes);
-  std::memset(b.ready_buf, 0, bytes);
-  std::memset(b.accum_buf, 0, bytes);
-  b.buf_px = px;
+
+  const size_t px = (size_t)img->header.w * (size_t)img->header.h;
+
+  // Log whenever the canvas buffer pointer changes or size changes
+  if (b.front_buf != (uint16_t*)img->data || b.buf_px != px) {
+    ESP_LOGI(TAG,
+      "Using canvas buffer: cv=%p img=%p data=%p w=%d h=%d cf=%u(%s) LV_COLOR_DEPTH=%d buf_px(old=%u -> new=%u)",
+      (void*)b.canvas, (void*)img, (void*)img->data,
+      (int)img->header.w, (int)img->header.h,
+      (unsigned)img->header.cf, img_cf_name(img->header.cf),
+      (int)LV_COLOR_DEPTH,
+      (unsigned)b.buf_px, (unsigned)px);
+  }
+
+  b.front_buf = (uint16_t*) img->data;
+
+  // 2) (Re)allocate only ready/accum when size changes; front is canvas-owned.
+  if (b.buf_px != px) {
+    free_ready_accum_(b);
+    b.buf_px = px;
+  }
+  size_t bytes = px * sizeof(uint16_t);
+  if (!b.ready_buf) {
+    b.ready_buf = static_cast<uint16_t*>(lv_mem_alloc(bytes));
+    if (!b.ready_buf) { free_ready_accum_(b); b.buf_px = 0; return; }
+    std::memset(b.ready_buf, 0, bytes);
+  }
+
+  if (!b.accum_buf) {
+    b.accum_buf = static_cast<uint16_t*>(lv_mem_alloc(bytes));
+    if (!b.accum_buf) { free_ready_accum_(b); b.buf_px = 0; return; }
+    std::memset(b.accum_buf, 0, bytes);
+  }
 }
 
 DdpStream::Binding* DdpStream::find_binding_(uint8_t id) {
@@ -397,13 +428,9 @@ DdpStream::Binding* DdpStream::find_binding_(uint8_t id) {
   return &it->second;
 }
 
-void DdpStream::free_binding_buffers_(Binding &b, bool keep_front_bound) {
-  // If the canvas is currently bound to front_buf, do not free it unless caller guarantees
-  // lv_canvas_set_buffer() will be pointed elsewhere first.
-  if (!keep_front_bound && b.front_buf) { lv_mem_free(b.front_buf); b.front_buf = nullptr; }
+void DdpStream::free_ready_accum_(Binding &b) {
   if (b.ready_buf) { lv_mem_free(b.ready_buf); b.ready_buf = nullptr; }
   if (b.accum_buf) { lv_mem_free(b.accum_buf); b.accum_buf = nullptr; }
-  b.buf_px = 0;
   b.have_ready.store(false);
 }
 
@@ -420,10 +447,8 @@ void DdpStream::on_canvas_size_changed_(lv_event_t *e) {
     int H = (int) lv_obj_get_height(canvas);
     if (b.w <= 0) b.w = W;
     if (b.h <= 0) b.h = H;
+    // Re-adopt the canvas buffer and resize ready/accum if needed.
     self->ensure_binding_buffers_(b);
-    if (b.front_buf) {
-      canvas_set_buf_rgb565(b.canvas, b.front_buf, b.w, b.h);
-    }
     break;
   }
 }
@@ -440,7 +465,7 @@ void DdpStream::handle_packet_(const uint8_t *raw, size_t n) {
 
   uint8_t id = h->id;
   Binding *b = this->find_binding_(id);
-  if (!b || !b->canvas || b->w <= 0 || b->h <= 0) return;
+  if (!b || !b->canvas || b->buf_px == 0) return;
 
   uint32_t offset = ntohl(h->offset_be);
   uint16_t len    = ntohs(h->length_be);
@@ -483,7 +508,7 @@ void DdpStream::handle_packet_(const uint8_t *raw, size_t n) {
 
   size_t pixel_off = offset / 3;
   size_t px        = len / 3;
-  size_t max_px    = (size_t) b->w * (size_t) b->h;
+  size_t max_px    = b->buf_px;
   if (pixel_off >= max_px) return;
   size_t write_px  = std::min(px, max_px - pixel_off);
 
@@ -552,7 +577,7 @@ void DdpStream::handle_packet_(const uint8_t *raw, size_t n) {
     b->frames_push += 1;
     b->win_frames_push += 1;
 
-    const size_t expected_bytes = (size_t)b->w * (size_t)b->h * 3;
+    const size_t expected_bytes = b->buf_px * 3;
     double cov = (expected_bytes > 0)
       ? std::min(1.0, (double)b->frame_bytes_accum / (double)expected_bytes)
       : 0.0;
