@@ -14,6 +14,7 @@ import time
 import traceback
 from typing import Optional, Dict, Any
 from urllib.parse import urlparse, unquote
+import urllib.request as _urlreq
 
 try:
     from urllib.request import url2pathname
@@ -89,6 +90,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         }
     },
     "playback": {"loop": True},
+    # Still-image quality controls for tiny/low-DPI targets
+    "image": {
+        # method: lanczos | bicubic | bilinear | box | nearest
+        "method": "lanczos",
+        # Do resize in linear light (gamma-aware) to preserve tones
+        "gamma_correct": True,
+        # Optional mild sharpen after resize (0 disables)
+        "unsharp": {"amount": 0.0, "radius": 0.6, "threshold": 2}
+    },
     "log": {"send_ms": False, "rate_ms": 1000, "detail": False, "metrics": True},
     "net": {
         "win_timer_res": True,
@@ -96,6 +106,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "spread_max_fps": 60,
         "spread_min_ms": 3.0,
         "spread_max_sleeps": 0
+    },
+    # Optional resend policy for single-frame (non-looping) stills over UDP.
+    # Re-sends use the SAME DDP seq as the first send, so the client can
+    # fill any missed packets without flicker.
+    "playback_still": {
+        "burst": 3,
+        "spacing_ms": 100,
+        "tail_s": 2.0,
+        "tail_hz": 2
     }
 }
 
@@ -344,18 +363,127 @@ def _resolve_stream_url(srcu: str) -> tuple[str, Dict[str, str]]:
 
 
 # -------------------------
+# HTTP helpers (content-type probe)
+# -------------------------
+
+def _is_http_url(u: str) -> bool:
+    try:
+        s = (urlparse(u).scheme or "").lower()
+        return s in ("http", "https")
+    except Exception:
+        return False
+
+
+def _probe_http_content_type(url: str, timeout: float = 3.0) -> Optional[str]:
+    """Try HEAD to get Content-Type. If server rejects HEAD, try a tiny GET with Range."""
+    if not _is_http_url(url):
+        return None
+    try:
+        req = _urlreq.Request(url, method="HEAD")
+        with _urlreq.urlopen(req, timeout=timeout) as resp:
+            ct = resp.headers.get("Content-Type")
+            return (ct or "").split(";")[0].strip().lower() or None
+    except Exception:
+        try:
+            req = _urlreq.Request(url, method="GET", headers={"Range": "bytes=0-0"})
+            with _urlreq.urlopen(req, timeout=timeout) as resp:
+                ct = resp.headers.get("Content-Type")
+                return (ct or "").split(";")[0].strip().lower() or None
+        except Exception:
+            return None
+
+
+# -------------------------
 # Imaging helpers
 # -------------------------
 
 def _resize_pad_to_rgb_bytes(img: Image.Image, size: tuple[int, int]) -> bytes:
     w, h = size
+
+    # --- choose resample method ---
+    cfg = CONFIG.get("image", {}) or {}
+    method_s = str(cfg.get("method", "lanczos")).lower()
+    M = Image.Resampling
+    METHOD_MAP = {
+        "lanczos": M.LANCZOS,
+        "bicubic": M.BICUBIC,
+        "bilinear": M.BILINEAR,
+        "box":     M.BOX,       # area-average; good for big downscales, softer micro-contrast
+        "nearest": M.NEAREST,   # use for pixel art/UI icons
+    }
+    resample = METHOD_MAP.get(method_s, M.LANCZOS)
+
+    # Animated sources often look better without heavy kernels;
+    # let config override, but default to NEAREST for animated.
+    if getattr(img, "is_animated", False) and method_s == "lanczos":
+        resample = M.NEAREST
+
+    # --- gamma-aware resize (linear light) ---
+    gamma_correct = bool(cfg.get("gamma_correct", True))
+    def _to_linear_u8(rgb_u8: np.ndarray) -> np.ndarray:
+        # sRGB -> linear via 1D LUT (fast & accurate for u8)
+        # rgb_u8 is shape (H,W,3), dtype=uint8
+        if not hasattr(_to_linear_u8, "_lut"):
+            # build once
+            x = np.arange(256, dtype=np.float32) / 255.0
+            lut = np.where(
+                x <= 0.04045,
+                x / 12.92,
+                ((x + 0.055) / 1.055) ** 2.4
+            )
+            _to_linear_u8._lut = (lut * 65535.0 + 0.5).astype(np.uint16)  # promote for precision
+        return _to_linear_u8._lut[rgb_u8]
+
+    def _to_srgb_u8(lin_u16: np.ndarray) -> np.ndarray:
+        if not hasattr(_to_srgb_u8, "_lut"):
+            y = np.linspace(0.0, 1.0, 65536, dtype=np.float32)
+            lut = np.where(
+                y <= 0.0031308,
+                y * 12.92,
+                1.055 * (y ** (1/2.4)) - 0.055
+            )
+            _to_srgb_u8._lut = (lut * 255.0 + 0.5).astype(np.uint8)
+        return _to_srgb_u8._lut[lin_u16]
+
+    # Convert to RGB early (handle "L", "LA", "RGBA", etc.)
     if img.mode != "RGB":
         img = img.convert("RGB")
-    im = ImageOps.contain(
-        img, size,
-        method=Image.Resampling.NEAREST if getattr(img, "is_animated", False)
-        else Image.Resampling.BILINEAR
-    )
+
+    # Compute contain size once (no resampling yet)
+    src_w, src_h = img.size
+    if src_w == 0 or src_h == 0:
+        return b""
+    scale = min(w / src_w, h / src_h) if src_w and src_h else 1.0
+    new_w = max(1, int(round(src_w * scale)))
+    new_h = max(1, int(round(src_h * scale)))
+    new_size = (new_w, new_h)
+
+    if gamma_correct and resample not in (M.NEAREST,):
+        # Work in linear: resize each channel individually as 16-bit, then convert back to sRGB u8
+        arr = np.asarray(img, dtype=np.uint8)
+        lin = _to_linear_u8(arr)  # (H,W,3) uint16
+        # Resize channels one by one (avoid merge("I;16"))
+        r = Image.fromarray(lin[..., 0]).convert("I;16").resize(new_size, resample=resample)
+        g = Image.fromarray(lin[..., 1]).convert("I;16").resize(new_size, resample=resample)
+        b = Image.fromarray(lin[..., 2]).convert("I;16").resize(new_size, resample=resample)
+        lin_res = np.stack(
+            [np.array(r, dtype=np.uint16), np.array(g, dtype=np.uint16), np.array(b, dtype=np.uint16)],
+            axis=-1
+        )  # (new_h,new_w,3) uint16
+        srgb_u8 = _to_srgb_u8(lin_res)  # (new_h,new_w,3) u8
+        im = Image.fromarray(srgb_u8, mode="RGB")
+    else:
+        # Standard sRGB-space resize
+        im = img.resize(new_size, resample=resample)
+
+    # Optional mild sharpen to recover micro-contrast on very small outputs
+    us = cfg.get("unsharp", {}) or {}
+    amt = float(us.get("amount", 0.0))
+    if amt > 0.0:
+        radius = max(0.1, float(us.get("radius", 0.6)))
+        thresh = max(0, int(us.get("threshold", 2)))
+        im = im.filter(ImageFilter.UnsharpMask(radius=radius, percent=int(amt * 100), threshold=thresh))
+
     if im.size != size:
         canvas = Image.new("RGB", size, (0, 0, 0))
         canvas.paste(im, ((w - im.size[0]) // 2, (h - im.size[1]) // 2))
@@ -897,10 +1025,26 @@ def iter_frames(
 ):
     srcu = unquote(src)
     low = srcu.lower()
-    if not any(low.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif")):
-        yield from _iter_frames_pyav(srcu, size, loop_video, expand_mode=expand_mode, hw_prefer=hw_prefer)
-    else:
-        yield from _iter_frames_imageio(srcu, size, loop_video)
+    # Prefer extension check first for local paths.
+    is_image_ext = any(low.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif"))
+    if is_image_ext:
+        return (yield from _iter_frames_imageio(srcu, size, loop_video))
+
+    # For HTTP(S) sources where the URL doesn't reveal type (e.g., HA proxy),
+    # probe Content-Type to avoid spinning up the PyAV video graph for stills.
+    if _is_http_url(srcu):
+        ct = _probe_http_content_type(srcu)
+        if ct:
+            if ct.startswith("image/"):
+                print(f"[detect] http Content-Type={ct} -> using imageio still path")
+                return (yield from _iter_frames_imageio(srcu, size, loop_video))
+            # You could optionally special-case 'application/octet-stream' etc.,
+            # but defaulting to PyAV for unknowns is safest.
+        else:
+            print("[detect] http Content-Type probe failed; defaulting to video path")
+
+    # Default: treat as video (PyAV)
+    yield from _iter_frames_pyav(srcu, size, loop_video, expand_mode=expand_mode, hw_prefer=hw_prefer)
 
 
 # -------------------------
@@ -1043,6 +1187,9 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
         ema_alpha = float(opts.get("ema_alpha", 0.0))
 
         frames_emitted = 0
+        # For optional still resends:
+        last_frame_buf: Optional[bytes] = None
+        last_frame_seq: Optional[int] = None
         packets_enqueued = 0
         last_log = time.perf_counter()
         seq = 0
@@ -1087,6 +1234,9 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
                     async with latest_lock:
                         latest["buf"] = rgb888
                     frames_emitted += 1
+                    last_frame_buf = rgb888
+                    last_frame_seq = (seq - 1) & 0x0F
+
                     if log_metrics:
                         frm_meter.tick(time.perf_counter())
                     seq = (seq + 1) & 0x0F
@@ -1168,6 +1318,9 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
                     spacing, group_n = (None, 1)
 
                 await enqueue_frame(rgb888, seq, packet_spacing_s=spacing, group_n=group_n)
+                # Cache last frame for optional still resends (same seq, no re-decode)
+                last_frame_buf = rgb888
+                last_frame_seq = seq & 0x0F
                 seq = (seq + 1) & 0x0F
                 frames_emitted += 1
 
@@ -1195,6 +1348,65 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
 
                 next_t += delay_s
                 await asyncio.sleep(max(0.0, next_t - loop.time()))
+
+        # If this was a non-looping still (exactly one frame), optionally resend it a few times.
+        try:
+            resend_cfg = CONFIG.get("playback_still", {}) or {}
+            burst = int(resend_cfg.get("burst", 0))
+            spacing_ms = max(0.0, float(resend_cfg.get("spacing_ms", 100.0)))
+            tail_s = max(0.0, float(resend_cfg.get("tail_s", 0.0)))
+            tail_hz = max(0, int(resend_cfg.get("tail_hz", 0)))
+
+            is_nonloop = not bool(opts.get("loop"))
+            is_single_frame = (frames_emitted == 1)
+            if is_nonloop and is_single_frame and last_frame_buf is not None and last_frame_seq is not None:
+                detail = bool(CONFIG.get("log", {}).get("detail", False))
+                tx0 = proto.packets_sent
+                enq0 = packets_enqueued
+
+                # --- Burst phase ---
+                if burst > 0:
+                    print(f"[send] still out={out_id} seq={last_frame_seq} burst={burst} spacing={spacing_ms:.0f}ms bytes={len(last_frame_buf)}")
+                    for i in range(burst):
+                        before_enq = packets_enqueued
+                        await enqueue_frame(last_frame_buf, last_frame_seq)
+                        after_enq = packets_enqueued
+                        if detail:
+                            print(f"[send] still-burst out={out_id} {i+1}/{burst} enq+={after_enq-before_enq} q={q.qsize()}/{max_in_flight}")
+                        if spacing_ms > 0:
+                            await asyncio.sleep(spacing_ms / 1000.0)
+
+                # --- Tail phase ---
+                if tail_s > 0.0 and tail_hz > 0:
+                    est = int(tail_s * tail_hz)
+                    print(f"[send] still-tail out={out_id} hz={tail_hz} dur={tail_s:.1f}s (~{est} sends)")
+                    tick = 1.0 / float(tail_hz)
+                    t_end = loop.time() + tail_s
+                    next_t = loop.time()
+                    i = 0
+                    while loop.time() < t_end:
+                        before_enq = packets_enqueued
+                        await enqueue_frame(last_frame_buf, last_frame_seq)
+                        after_enq = packets_enqueued
+                        i += 1
+                        if log_metrics:
+                            q_occ_samples.append(q.qsize())
+                        if detail:
+                            print(f"[send] still-tail out={out_id} {i}/{est} enq+={after_enq-before_enq} q={q.qsize()}/{max_in_flight}")
+                        await asyncio.sleep(max(0.0, next_t - loop.time()))
+                        next_t += tick
+
+                # --- Final summary ---
+                tx_delta = proto.packets_sent - tx0
+                enq_delta = packets_enqueued - enq0
+                if burst > 0 or (tail_s > 0.0 and tail_hz > 0):
+                    print(f"[send] still-done out={out_id} enq+={enq_delta} tx+={tx_delta} drops={q_drops}")
+        except Exception as _still_e:
+            # Resend policy must never take down the task; log and continue.
+            print(f"[send] still-resend skipped due to error: {_still_e!r}")
+        finally:
+            last_frame_buf = None
+            last_frame_seq = None
 
         # Try to flush the queue quickly; don't hang forever if we're being cancelled.
         try:
