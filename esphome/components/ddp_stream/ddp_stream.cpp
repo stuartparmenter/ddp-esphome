@@ -72,6 +72,7 @@ void DdpStream::add_stream_binding(uint8_t id,
   dst.getter = std::move(getter);
   dst.w = w;
   dst.h = h;
+  dst.back_buffers = default_back_buffers_;
   this->bind_if_possible_(dst);
 }
 
@@ -81,7 +82,20 @@ void DdpStream::set_stream_canvas(uint8_t id, lv_obj_t* canvas, int w, int h) {
   dst.canvas = canvas;
   dst.w = w;
   dst.h = h;
+  if (dst.back_buffers > 2) dst.back_buffers = 2;
   this->bind_if_possible_(dst);
+}
+
+void DdpStream::set_stream_back_buffers(uint8_t id, uint8_t n) {
+  auto it = bindings_.find(id);
+  if (it == bindings_.end()) return;
+  Binding &b = it->second;
+  uint8_t nb = (n > 2) ? 2 : n;
+  if (b.back_buffers == nb) return;
+  // Re-provision buffers according to the new mode
+  b.back_buffers = nb;
+  free_ready_accum_(b);
+  ensure_binding_buffers_(b);  // will (re)allocate as needed for mode/size
 }
 
 bool DdpStream::get_stream_size(uint8_t id, int *w, int *h) const {
@@ -133,8 +147,8 @@ void DdpStream::dump_config() {
   ESP_LOGCONFIG(TAG, "  UDP port: %u", port_);
   for (auto &kv : bindings_) {
     const Binding &b = kv.second;
-    ESP_LOGCONFIG(TAG, "  stream id %u -> %dx%d canvas=%p (buf_px=%u)",
-                  kv.first, b.w, b.h, (void*) b.canvas, (unsigned) b.buf_px);
+    ESP_LOGCONFIG(TAG, "  stream id %u -> %dx%d canvas=%p (buf_px=%u) back_buffers=%u",
+                  kv.first, b.w, b.h, (void*) b.canvas, (unsigned) b.buf_px, (unsigned) b.back_buffers);
   }
 }
 
@@ -142,18 +156,28 @@ void DdpStream::loop() {
   for (auto &kv : bindings_) {
     Binding &b = kv.second;
 
-    if (!b.have_ready.exchange(false))
-      continue;
-
-    if (!b.canvas || b.buf_px == 0)
-      continue;
-
-    // copy ready -> front using the actual buffer length in pixels
-    if (b.buf_px && b.front_buf && b.ready_buf) {
-      std::memcpy(b.front_buf, b.ready_buf, b.buf_px * sizeof(uint16_t));
+    // Triple-buffer path: copy ready->front
+    if (b.back_buffers == 2) {
+      if (!b.have_ready.exchange(false)) continue;
+      if (!b.canvas || b.buf_px == 0) continue;
+      if (b.buf_px && b.front_buf && b.ready_buf) {
+        std::memcpy(b.front_buf, b.ready_buf, b.buf_px * sizeof(uint16_t));
+      }
+      b.need_invalidate.store(true, std::memory_order_relaxed);
     }
 
-    lv_obj_invalidate(b.canvas);
+    // Double-buffer path: do memcpy on the LVGL/main thread
+    if (b.back_buffers == 1 && b.need_copy_to_front.exchange(false)) {
+      if (b.front_buf && b.accum_buf && b.buf_px) {
+        std::memcpy(b.front_buf, b.accum_buf, b.buf_px * sizeof(uint16_t));
+      }
+      b.need_invalidate.store(true, std::memory_order_relaxed);
+    }
+
+    // If any mode requested an invalidate, do it here (safe w.r.t LVGL refresh)
+    if (b.need_invalidate.exchange(false)) {
+      if (b.canvas) lv_obj_invalidate(b.canvas);
+    }
 
 #if DDP_STREAM_METRICS
     // queue wait time (ready -> present)
@@ -369,7 +393,10 @@ void DdpStream::bind_if_possible_(Binding &b) {
   }
   if (b.w <= 0 || b.h <= 0) return;
   ensure_binding_buffers_(b);
-  if (!b.front_buf || !b.ready_buf || !b.accum_buf) return;
+  // In mode 2 we require ready+accum; in mode 1 we require accum; in mode 0 we only require front.
+  if (!b.front_buf) return;
+  if (b.back_buffers == 2 && (!b.ready_buf || !b.accum_buf)) return;
+  if (b.back_buffers == 1 && (!b.accum_buf)) return;
 
   // Clear immediately to avoid first-show flash.
   lv_canvas_fill_bg(b.canvas, lv_color_black(), LV_OPA_COVER);
@@ -409,17 +436,21 @@ void DdpStream::ensure_binding_buffers_(Binding &b) {
     b.buf_px = px;
   }
   size_t bytes = px * sizeof(uint16_t);
-  if (!b.ready_buf) {
+  if (b.back_buffers == 2 && !b.ready_buf) {
     b.ready_buf = static_cast<uint16_t*>(lv_mem_alloc(bytes));
     if (!b.ready_buf) { free_ready_accum_(b); b.buf_px = 0; return; }
     std::memset(b.ready_buf, 0, bytes);
   }
 
-  if (!b.accum_buf) {
+  if ((b.back_buffers >= 1) && !b.accum_buf) {
     b.accum_buf = static_cast<uint16_t*>(lv_mem_alloc(bytes));
     if (!b.accum_buf) { free_ready_accum_(b); b.buf_px = 0; return; }
     std::memset(b.accum_buf, 0, bytes);
   }
+
+  // If we downsized mode (e.g., to 1 or 0), make sure extra buffers are freed.
+  if (b.back_buffers < 2 && b.ready_buf) { lv_mem_free(b.ready_buf); b.ready_buf = nullptr; }
+  if (b.back_buffers < 1 && b.accum_buf) { lv_mem_free(b.accum_buf); b.accum_buf = nullptr; }
 }
 
 DdpStream::Binding* DdpStream::find_binding_(uint8_t id) {
@@ -482,19 +513,25 @@ void DdpStream::handle_packet_(const uint8_t *raw, size_t n) {
         b->build_ms_ewma = ewma(b->build_ms_ewma, build_ms, 0.2);
       }
 #endif
-      if (b->have_ready.load()) {
+      if (b->back_buffers == 2) {
+        if (b->have_ready.load()) {
 #if DDP_STREAM_METRICS
-        b->frames_overrun += 1;
-        b->win_overrun += 1;
+          b->frames_overrun += 1;
+          b->win_overrun += 1;
 #endif
-      }
-      this->ensure_binding_buffers_(*b);
-      if (b->accum_buf) {
-        std::swap(b->ready_buf, b->accum_buf);
-        b->have_ready.store(true);
+        }
+        if (b->accum_buf) {
+          std::swap(b->ready_buf, b->accum_buf);
+          b->have_ready.store(true);
 #if DDP_STREAM_METRICS
-        b->ready_set_us = esp_timer_get_time();
+          b->ready_set_us = esp_timer_get_time();
 #endif
+        }
+      } else if (b->back_buffers == 1) {
+        b->need_copy_to_front.store(true, std::memory_order_relaxed);
+        b->need_invalidate.store(true, std::memory_order_relaxed);
+      } else { // back_buffers == 0
+        b->need_invalidate.store(true, std::memory_order_relaxed);
       }
     }
     return;
@@ -512,8 +549,16 @@ void DdpStream::handle_packet_(const uint8_t *raw, size_t n) {
   if (pixel_off >= max_px) return;
   size_t write_px  = std::min(px, max_px - pixel_off);
 
-  this->ensure_binding_buffers_(*b);
-  if (!b->accum_buf) return;
+  // Choose destination based on buffering mode:
+  uint16_t* dst = nullptr;
+  if (b->back_buffers == 0) {
+    // write directly into front (best for single stills)
+    if (!b->front_buf) return;
+    dst = b->front_buf + pixel_off;
+  } else {
+    if (!b->accum_buf) return;
+    dst = b->accum_buf + pixel_off;
+  }
 
 #if DDP_STREAM_METRICS
   if (!b->frame_seen_any) {
@@ -538,7 +583,6 @@ void DdpStream::handle_packet_(const uint8_t *raw, size_t n) {
   b->win_rx_bytes += len;
 #endif
 
-  uint16_t* dst = b->accum_buf + pixel_off;
   const uint8_t* sp = p;
 
 #if defined(LV_COLOR_16_SWAP) && LV_COLOR_16_SWAP
@@ -603,7 +647,7 @@ void DdpStream::handle_packet_(const uint8_t *raw, size_t n) {
     }
 #endif
 
-    if (b->have_ready.load()) {
+    if (b->back_buffers == 2 && b->have_ready.load()) {
 #if DDP_STREAM_METRICS
       b->frames_overrun += 1;
       b->win_overrun += 1;
@@ -611,8 +655,16 @@ void DdpStream::handle_packet_(const uint8_t *raw, size_t n) {
       // overwrite policy: keep newest
     }
 
-    std::swap(b->ready_buf, b->accum_buf);
-    b->have_ready.store(true);
+    if (b->back_buffers == 2) {
+      std::swap(b->ready_buf, b->accum_buf);
+      b->have_ready.store(true);
+      // copy happens in loop(); invalidate after copy
+    } else if (b->back_buffers == 1) {
+      b->need_copy_to_front.store(true, std::memory_order_relaxed);
+      b->need_invalidate.store(true, std::memory_order_relaxed);
+    } else { // back_buffers == 0
+      b->need_invalidate.store(true, std::memory_order_relaxed);
+    }
 #if DDP_STREAM_METRICS
     b->ready_set_us = esp_timer_get_time();
 #endif

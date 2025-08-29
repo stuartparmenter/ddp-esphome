@@ -44,12 +44,15 @@ class DdpStream : public Component {
  public:
   void set_port(uint16_t p) { port_ = p; }
   uint16_t get_port() const { return port_; }
+  void set_default_back_buffers(uint8_t n) { default_back_buffers_ = (n > 2 ? 2 : n); }
 
   void add_stream_binding(uint8_t id,
                           std::function<lv_obj_t*()> getter,
                           int w /* = -1 */, int h /* = -1 */);
 
   void set_stream_canvas(uint8_t id, lv_obj_t* canvas, int w, int h);
+  void set_stream_back_buffers(uint8_t id, uint8_t n);
+  void set_back_buffers_for(uint8_t id, uint8_t n) { set_stream_back_buffers(id, n); }
 
   bool get_stream_size(uint8_t id, int *w, int *h) const;
 
@@ -63,6 +66,7 @@ class DdpStream : public Component {
     std::function<lv_obj_t*()> getter;
     lv_obj_t* canvas{nullptr};
     int w{-1}, h{-1};
+    uint8_t back_buffers{2};     // 0=none, 1=double, 2=triple (default)
 
     // Triple buffering (RGB565), allocated via lv_mem_alloc (PSRAM-aware)
     uint16_t* front_buf{nullptr};  // currently displayed (owned by the canvas)
@@ -70,6 +74,8 @@ class DdpStream : public Component {
     uint16_t* accum_buf{nullptr};  // RX writes current frame here
     size_t    buf_px{0};           // buffer length in pixels (for all three)
     std::atomic<bool> have_ready{false}; // a frame is queued for present
+    std::atomic<bool> need_copy_to_front{false}; // for back_buffers==1
+    std::atomic<bool> need_invalidate{false};    // for back_buffers==0/1
 
 #if DDP_STREAM_METRICS
     // Totals
@@ -146,6 +152,7 @@ class DdpStream : public Component {
   uint16_t port_{4048};
   int sock_{-1};
   TaskHandle_t task_{nullptr};
+  uint8_t default_back_buffers_{2};
 
   bool udp_opened_{false};
   std::map<uint8_t, Binding> bindings_;
