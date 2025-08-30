@@ -471,7 +471,7 @@ def _resize_pad_to_rgb_bytes(img: Image.Image, size: tuple[int, int]) -> bytes:
             axis=-1
         )  # (new_h,new_w,3) uint16
         srgb_u8 = _to_srgb_u8(lin_res)  # (new_h,new_w,3) u8
-        im = Image.fromarray(srgb_u8, mode="RGB")
+        im = Image.fromarray(srgb_u8).convert("RGB")
     else:
         # Standard sRGB-space resize
         im = img.resize(new_size, resample=resample)
