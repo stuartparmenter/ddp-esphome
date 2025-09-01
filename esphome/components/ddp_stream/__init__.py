@@ -24,7 +24,7 @@ CONFIG_SCHEMA = cv.Schema({
     cv.GenerateID(): cv.declare_id(DdpStream),
     cv.Optional(CONF_PORT, default=4048): cv.port,
     cv.Optional(CONF_STREAMS, default=[]): cv.ensure_list(STREAM_SCHEMA),
-    cv.Optional("back_buffers", default=2): cv.one_of(0, 1, 2, int=True),
+    cv.Optional("back_buffers", default=0): cv.one_of(0, 1, 2, int=True),
 })
 
 async def to_code(config):

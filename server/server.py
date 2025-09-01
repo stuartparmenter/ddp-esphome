@@ -1059,22 +1059,61 @@ _DDP_MAX_DATA = 1440
 #   flags: 0x40 => header present, 0x01 => PUSH (end-of-frame)
 #   seq:   0..255 sequence number (low 8 bits used)
 #   cfg:   pixel config; 0x2C = RGB888 (per 3waylabs DDP spec)
+#          EXT: 0x61 = RGB565(BE), 0x62 = RGB565(LE)
 #   out_id: destination output/canvas id (0..255)
 #   offset: byte offset within the frame buffer
 #   length: payload bytes in this packet
 _DDP_HDR = struct.Struct("!BBB B I H")  # flags, seq, cfg, out_id, offset, length (network byte order)
 _DDP_PIXEL_CFG_RGB888 = 0x2C
+_DDP_PIXEL_CFG_RGB565_BE = 0x61
+_DDP_PIXEL_CFG_RGB565_LE = 0x62
 
+def _normalize_fmt(s: str) -> str:
+    s = (s or "rgb888").strip().lower()
+    if s in ("rgb565", "565"):  # default to LE if unspecified
+        return "rgb565le"
+    return s
 
-def _ddp_iter_packets(rgb_bytes: bytes, output_id: int, seq: int):
-    mv = memoryview(rgb_bytes)
-    total = len(mv)
+def _rgb888_to_565_bytes(rgb_bytes: bytes, endian: str) -> bytes:
+    """Convert packed RGB888 (R,G,B byte triplets) to packed RGB565 bytes with specified endianness."""
+    arr = np.frombuffer(rgb_bytes, dtype=np.uint8)
+    if arr.size % 3 != 0:
+        # Truncate any ragged tail (shouldn't happen for correctly sized frames)
+        arr = arr[: (arr.size // 3) * 3]
+    pix = arr.reshape((-1, 3))
+    r = (pix[:, 0] >> 3).astype(np.uint16)
+    g = (pix[:, 1] >> 2).astype(np.uint16)
+    b = (pix[:, 2] >> 3).astype(np.uint16)
+    v = (r << 11) | (g << 5) | b
+    if endian == "be":
+        return v.byteswap().tobytes()  # store MSB,LSB
+    else:
+        # '<' little-endian memory order
+        return v.tobytes()
+
+def _ddp_iter_packets(rgb_bytes: bytes, output_id: int, seq: int, *, fmt: str = "rgb888"):
+    fmt = _normalize_fmt(fmt)
+    if fmt == "rgb888":
+        pixcfg = _DDP_PIXEL_CFG_RGB888
+        payload = memoryview(rgb_bytes)
+    elif fmt == "rgb565le":
+        pixcfg = _DDP_PIXEL_CFG_RGB565_LE
+        payload = memoryview(_rgb888_to_565_bytes(rgb_bytes, "le"))
+    elif fmt == "rgb565be":
+        pixcfg = _DDP_PIXEL_CFG_RGB565_BE
+        payload = memoryview(_rgb888_to_565_bytes(rgb_bytes, "be"))
+    else:
+        # Fallback to 888 if unknown token
+        pixcfg = _DDP_PIXEL_CFG_RGB888
+        payload = memoryview(rgb_bytes)
+
+    total = len(payload)
     off = 0
     push_mask = 0x01
     ddp_base_flags = 0x40  # header present (per DDP spec); we'll OR in PUSH (0x01) on the last packet of a frame
     while off < total:
         end = min(off + _DDP_MAX_DATA, total)
-        chunk = mv[off:end]
+        chunk = payload[off:end]
         is_last = end >= total
         flags = ddp_base_flags | (push_mask if is_last else 0)
         payload_len = len(chunk)
@@ -1083,7 +1122,7 @@ def _ddp_iter_packets(rgb_bytes: bytes, output_id: int, seq: int):
             pkt, 0,
             flags,
             seq & 0xFF,
-            _DDP_PIXEL_CFG_RGB888,
+            pixcfg,
             output_id & 0xFF,
             off,
             payload_len
@@ -1194,6 +1233,14 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
         last_log = time.perf_counter()
         seq = 0
 
+        # Precompute for spacing calculations
+        fmt = _normalize_fmt(str(opts.get("fmt", "rgb888")))
+        def _effective_payload_len(n_rgb888: int) -> int:
+            if fmt == "rgb888":
+                return n_rgb888
+            # 3 bytes -> 2 bytes per pixel for 565
+            return (n_rgb888 // 3) * 2
+
         async def enqueue_frame(rgb888: bytes, seq_val: int,
                                 *, packet_spacing_s: Optional[float] = None,
                                    group_n: int = 1):
@@ -1203,7 +1250,7 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
             slot_idx = 0
             group_left = group_n
 
-            for pkt in _ddp_iter_packets(rgb888, out_id, seq_val):
+            for pkt in _ddp_iter_packets(rgb888, out_id, seq_val, fmt=fmt):
                 if q.full():
                     try:
                         q.get_nowait()
@@ -1279,7 +1326,8 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
                             outb = ema_buf_f32.astype(np.uint8, copy=False).tobytes()
 
                         if spread_enabled and pace_hz <= spread_max_fps:
-                            pkt_count = (len(outb) + _DDP_MAX_DATA - 1) // _DDP_MAX_DATA
+                            tot = _effective_payload_len(len(outb))
+                            pkt_count = (tot + _DDP_MAX_DATA - 1) // _DDP_MAX_DATA
                             spacing, group_n = _compute_spacing_and_group(pkt_count, tick)
                         else:
                             spacing, group_n = (None, 1)
@@ -1310,7 +1358,8 @@ async def ddp_task(target_ip: str, target_port: int, out_id: int, *, size, src, 
                 if spread_enabled:
                     inst_fps = (1.0 / delay_s) if delay_s > 0 else 1e9
                     if inst_fps <= spread_max_fps:
-                        pkt_count = (len(rgb888) + _DDP_MAX_DATA - 1) // _DDP_MAX_DATA
+                        tot = _effective_payload_len(len(rgb888))
+                        pkt_count = (tot + _DDP_MAX_DATA - 1) // _DDP_MAX_DATA
                         spacing, group_n = _compute_spacing_and_group(pkt_count, delay_s)
                     else:
                         spacing, group_n = (None, 1)
@@ -1505,6 +1554,7 @@ async def handle_control(ws):
             raise ValueError(f"start_stream requires positive w/h (got {w}x{h})")
         src = str(msg["src"])
         ddp_port = int(msg.get("ddp_port", 4048))
+        fmt = _normalize_fmt(msg.get("fmt", "rgb888"))
 
         pace_hz = _parse_pace_hz(msg.get("pace", 0))
         opts = {
@@ -1513,6 +1563,7 @@ async def handle_control(ws):
             "hw": _parse_hw(msg.get("hw"), CONFIG["hw"]["prefer"]),
             "pace_hz": pace_hz,
             "ema_alpha": max(0.0, min(float(msg.get("ema", 0.0)), 1.0)),
+            "fmt": fmt,
         }
 
         srcu = unquote(src)
@@ -1529,7 +1580,8 @@ async def handle_control(ws):
                     await t_old
 
         print(f"* start_stream {session['ip']} dev={session['device_id']} out={out} size={w}x{h} ddp_port={ddp_port} "
-              f"src={src} pace={opts['pace_hz']} ema={opts['ema_alpha']} expand={opts['expand_mode']} loop={opts['loop']} hw={opts['hw']}")
+              f"src={src} pace={opts['pace_hz']} ema={opts['ema_alpha']} expand={opts['expand_mode']} loop={opts['loop']} hw={opts['hw']} "
+              f"fmt={opts['fmt']}")
 
         task = asyncio.create_task(ddp_task(session["ip"], ddp_port, out, size=(w, h), src=src, opts=opts))
 
@@ -1574,7 +1626,7 @@ async def handle_control(ws):
 
         base = {"type": "start_stream", "out": out}
         applied = {}
-        for k in ("w", "h", "ddp_port", "src", "pace", "ema", "expand", "loop", "hw"):
+        for k in ("w", "h", "ddp_port", "src", "pace", "ema", "expand", "loop", "hw", "fmt"):
             if k in msg:
                 base[k] = msg[k]
                 applied[k] = msg[k]

@@ -36,6 +36,10 @@ OUTPUT_SCHEMA = cv.Schema({
     cv.Optional("hw", default="auto"): cv.one_of(
         "auto", "none", "cuda", "qsv", "vaapi", "videotoolbox", "d3d11va", lower=True
     ),
+    # Per-output transport format. 'rgb565' will auto-pick endian from the sink.
+    cv.Optional("format", default="rgb888"): cv.one_of(
+        "rgb888", "rgb565", "rgb565le", "rgb565be", lower=True
+    ),
 })
 
 CONFIG_SCHEMA = cv.Schema({
@@ -83,6 +87,7 @@ async def to_code(config):
             exp_i,
             s.get("loop", True),
             s.get("hw", "auto"),
+            s.get("format", "rgb888"),
         ))
 
     # Ensure esp_websocket_client is linked

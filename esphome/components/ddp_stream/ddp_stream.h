@@ -33,12 +33,18 @@ namespace ddp_stream {
 struct DdpHeader {
   uint8_t  flags;        // bit6=DDP(0x40), bit0=PUSH(0x01)
   uint8_t  seq;          // low 4 bits commonly used in DDP
-  uint8_t  pixcfg;       // 0x2C for RGB888
+  uint8_t  pixcfg;       // 0x2C = RGB888; EXT: 0x61 = RGB565(BE), 0x62 = RGB565(LE)
   uint8_t  id;           // stream/output id
   uint32_t offset_be;    // big-endian byte offset (RGB888)
   uint16_t length_be;    // big-endian payload length
 };
 #pragma pack(pop)
+
+// Pixel config constants (DDP 'cfg' byte)
+static constexpr uint8_t DDP_PIXCFG_RGB888     = 0x2C;
+// Custom extension values to indicate 16-bpp transport:
+static constexpr uint8_t DDP_PIXCFG_RGB565_BE  = 0x61;
+static constexpr uint8_t DDP_PIXCFG_RGB565_LE  = 0x62;
 
 class DdpStream : public Component {
  public:
@@ -80,7 +86,8 @@ class DdpStream : public Component {
 #if DDP_STREAM_METRICS
     // Totals
     uint64_t rx_pkts{0};
-    uint64_t rx_bytes{0};
+    uint64_t rx_bytes{0};         // DDP pixel payload bytes (header excluded)
+    uint64_t rx_wire_bytes{0};    // UDP payload bytes (header included)
 
     // Frame assembly
     size_t   frame_bytes_accum{0};
@@ -117,7 +124,8 @@ class DdpStream : public Component {
     int64_t  log_t0_us{0};
     uint32_t win_frames_push{0};
     uint32_t win_frames_presented{0};
-    uint64_t win_rx_bytes{0};
+    uint64_t win_rx_bytes{0};        // payload only
+    uint64_t win_rx_wire_bytes{0};   // UDP payload (wire)
     uint32_t win_pkt_gap{0};
     uint32_t win_overrun{0};
 
@@ -126,7 +134,10 @@ class DdpStream : public Component {
     double   qwait_ms_ewma{0.0};
     double   build_ms_ewma{0.0};
 
-    // NEW: max inter-packet gap within a frame (diagnostic)
+    // When we enqueue a present, remember the frame's first packet ts for present-lat calc.
+    int64_t  present_first_pkt_us{0};
+
+    // max inter-packet gap within a frame
     double   intra_ms_max{0.0};
     int64_t  last_pkt_us{0};
 #endif
@@ -147,12 +158,18 @@ class DdpStream : public Component {
   static void on_canvas_size_changed_(lv_event_t *e);
 
   Binding* find_binding_(uint8_t id);
+
+  // Packet dispatcher + helpers
   void handle_packet_(const uint8_t *buf, size_t len);
+  void handle_push_(Binding &b, const DdpHeader* h);
+  void handle_rgb888_(Binding &b, const DdpHeader* h, const uint8_t* payload, size_t len);
+  void handle_rgb565_(Binding &b, const DdpHeader* h, const uint8_t* payload, size_t len);
 
   uint16_t port_{4048};
   int sock_{-1};
   TaskHandle_t task_{nullptr};
   uint8_t default_back_buffers_{2};
+  uint8_t  preferred_fmt_{0};  // 0=RGB888 (default), 1=RGB565
 
   bool udp_opened_{false};
   std::map<uint8_t, Binding> bindings_;

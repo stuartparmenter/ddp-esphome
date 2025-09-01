@@ -18,6 +18,90 @@ static const char *TAG = "ws_ddp_control";
 namespace esphome {
 namespace ws_ddp_control {
 
+// ----------------- local helpers (no header changes required) -----------------
+static inline void append_json_str(std::string &dst, const char *key, const std::string &val) {
+  dst += "\""; dst += key; dst += "\":\""; dst += val; dst += "\"";
+}
+static inline void append_json_int(std::string &dst, const char *key, long long v) {
+  dst += "\""; dst += key; dst += "\":"; dst += std::to_string(v);
+}
+static inline void append_json_float(std::string &dst, const char *key, double v) {
+  char buf[64]; snprintf(buf, sizeof(buf), "\"%s\":%.6f", key, v); dst += buf;
+}
+static inline void append_json_bool(std::string &dst, const char *key, bool v) {
+  dst += "\""; dst += key; dst += "\":"; dst += (v ? "true" : "false");
+}
+
+// one canonical place to build the stream JSON (used by start_ and send_update_)
+static std::string build_stream_json_(const char *type,
+                                      uint8_t out,
+                                      int w, int h,
+                                      uint16_t ddp_port,
+                                      const std::string &src,
+                                      const std::string &fmt,
+                                      uint8_t pixcfg,
+                                      int pace, float ema, int expand, bool loop,
+                                      const std::string &hw) {
+  std::string json;
+  json.reserve(256);
+  json += "{";
+  append_json_str(json, "type", type);      json += ",";
+  append_json_int(json, "out", out);        json += ",";
+  append_json_int(json, "w", w);            json += ",";
+  append_json_int(json, "h", h);            json += ",";
+  append_json_int(json, "ddp_port", ddp_port); json += ",";
+  append_json_str(json, "src", src);        json += ",";
+  append_json_str(json, "fmt", fmt);        json += ",";
+  append_json_int(json, "pixcfg", (int) pixcfg); json += ",";
+  append_json_int(json, "pace", pace);      json += ",";
+  append_json_float(json, "ema", ema);      json += ",";
+  append_json_int(json, "expand", expand);  json += ",";
+  append_json_bool(json, "loop", loop);     json += ",";
+  append_json_str(json, "hw", hw);
+  json += "}";
+  return json;
+}
+
+static void log_stream_line_(const char *label,
+                             uint8_t out,
+                             int w, int h,
+                             uint16_t ddp_port,
+                             const std::string &src,
+                             const std::string &fmt,
+                             uint8_t pixcfg,
+                             int pace, float ema, int expand, bool loop,
+                             const std::string &hw) {
+  ESP_LOGI(TAG, "tx %s out=%u size=%dx%d src=%s ddp_port=%u fmt=%s pixcfg=0x%02X "
+                "pace=%d ema=%.3f expand=%d loop=%s hw=%s",
+           label,
+           (unsigned) out, w, h, src.c_str(), (unsigned) ddp_port,
+           fmt.c_str(), (unsigned) pixcfg,
+           pace, (double) ema, expand, loop ? "true":"false", hw.c_str());
+}
+
+// map format string -> ("fmt" field, pixcfg byte). For "rgb565" without endian,
+// we borrow endianness from the sink's LVGL (preferred_ddp_pixcfg()).
+static inline std::pair<std::string,uint8_t>
+resolve_fmt_and_pixcfg_(const std::string &fmt_in, ddp_stream::DdpStream *ddp) {
+  std::string f = fmt_in;
+  for (auto &c : f) c = (char)tolower((unsigned char)c);
+  if (f == "rgb888")
+    return { "rgb888", ddp_stream::DDP_PIXCFG_RGB888 };
+  if (f == "rgb565le")
+    return { "rgb565le", ddp_stream::DDP_PIXCFG_RGB565_LE };
+  if (f == "rgb565be")
+    return { "rgb565be", ddp_stream::DDP_PIXCFG_RGB565_BE };
+  if (f == "rgb565") {
+#if defined(LV_COLOR_16_SWAP) && LV_COLOR_16_SWAP
+    return { "rgb565be", ddp_stream::DDP_PIXCFG_RGB565_BE };
+#else
+    return { "rgb565le", ddp_stream::DDP_PIXCFG_RGB565_LE };
+#endif
+  }
+  // fallback
+  return { "rgb888", ddp_stream::DDP_PIXCFG_RGB888 };
+}
+
 // ------------- trampoline -------------
 void WsDdpControl::ws_event_trampoline(void *arg,
                                        esp_event_base_t /*base*/,
@@ -28,10 +112,10 @@ void WsDdpControl::ws_event_trampoline(void *arg,
 
   switch (event_id) {
     case WEBSOCKET_EVENT_CONNECTED:
-      if (self->running_) break;               // NEW: ignore duplicate CONNECTED
+      if (self->running_) break;               // ignore duplicate CONNECTED
       ESP_LOGI(TAG, "connected");
       self->running_ = true;
-      self->connecting_ = false;               // NEW: connecting -> false
+      self->connecting_ = false;
       self->send_hello_();
       // replay all active streams
       for (auto &kv : self->active_) if (kv.second) self->start_(kv.first);
@@ -41,7 +125,7 @@ void WsDdpControl::ws_event_trampoline(void *arg,
     case WEBSOCKET_EVENT_DISCONNECTED:
       ESP_LOGW(TAG, "disconnected");
       self->running_ = false;
-      self->connecting_ = false;               // NEW
+      self->connecting_ = false;
       break;
 
     case WEBSOCKET_EVENT_ERROR:
@@ -78,7 +162,7 @@ std::string WsDdpControl::build_uri_() const {
 
 // ------------- lifecycle -------------
 void WsDdpControl::connect() {
-  if (running_ || connecting_ || client_) return;   // NEW: idempotent
+  if (running_ || connecting_ || client_) return;   // idempotent
   if (!network::is_connected()) {
     ESP_LOGI(TAG, "network not ready; deferring connect");
     pending_connect_ = true;
@@ -86,7 +170,6 @@ void WsDdpControl::connect() {
     return;
   }
 
-  // If URI isn’t ready yet (templated host/url not populated), retry soon
   const std::string uri = this->build_uri_();
   if (uri.empty()) {
     ESP_LOGI(TAG, "URI not ready; retrying connect soon");
@@ -96,7 +179,7 @@ void WsDdpControl::connect() {
   }
 
   pending_connect_ = false;
-  connecting_ = true;                            // NEW
+  connecting_ = true;
   this->do_connect_();
 }
 
@@ -104,7 +187,7 @@ void WsDdpControl::do_connect_() {
   const std::string uri = this->build_uri_();
   if (uri.empty()) {
     ESP_LOGW(TAG, "connect(): no URI (provide url: or ws_host:/ws_port:)");
-    connecting_ = false;                         // NEW
+    connecting_ = false;
     return;
   }
 
@@ -123,7 +206,7 @@ void WsDdpControl::do_connect_() {
     ESP_LOGE(TAG, "init failed");
     static uint32_t backoff_ms = 500;
     backoff_ms = std::min<uint32_t>(backoff_ms * 2, 10000);
-    connecting_ = false;                         // NEW
+    connecting_ = false;
     this->set_timeout(backoff_ms, [this](){ this->connect(); });
     return;
   }
@@ -137,7 +220,7 @@ void WsDdpControl::do_connect_() {
     client_ = nullptr;
     static uint32_t backoff_ms = 500;
     backoff_ms = std::min<uint32_t>(backoff_ms * 2, 10000);
-    connecting_ = false;                         // NEW
+    connecting_ = false;
     this->set_timeout(backoff_ms, [this](){ this->connect(); });
     return;
   }
@@ -152,7 +235,7 @@ void WsDdpControl::do_connect_() {
     client_ = nullptr;
     static uint32_t backoff_ms = 500;
     backoff_ms = std::min<uint32_t>(backoff_ms * 2, 10000);
-    connecting_ = false;                         // NEW
+    connecting_ = false;
     this->set_timeout(backoff_ms, [this](){ this->connect(); });
   }
 }
@@ -160,7 +243,7 @@ void WsDdpControl::do_connect_() {
 void WsDdpControl::disconnect() {
   if (!client_) {
     running_ = false;
-    connecting_ = false;                         // NEW
+    connecting_ = false;
     pending_connect_ = false;
     return;
   }
@@ -169,7 +252,7 @@ void WsDdpControl::disconnect() {
   esp_websocket_client_destroy((esp_websocket_client_handle_t) client_);
   client_ = nullptr;
   running_ = false;
-  connecting_ = false;                           // NEW
+  connecting_ = false;
   pending_connect_ = false;
 }
 
@@ -193,12 +276,14 @@ void WsDdpControl::send_text(const char *json_utf8) {
 
 // ------------- orchestration API -------------
 void WsDdpControl::add_output(uint8_t id, int w, int h, const std::string &src_const,
-                              int pace, float ema, int expand, bool loop, const std::string &hw_const) {
+                              int pace, float ema, int expand, bool loop,
+                              const std::string &hw_const, const std::string &format_const) {
   OutCfg cfg;
   cfg.w = w; cfg.h = h;
   cfg.src_const = src_const;
   cfg.pace = pace; cfg.ema = ema; cfg.expand = expand; cfg.loop = loop;
   cfg.hw_const = hw_const;
+  cfg.format_const = format_const;
   outputs_[id] = std::move(cfg);
 }
 
@@ -206,7 +291,6 @@ void WsDdpControl::start(uint8_t out) {
   active_[out] = true;
   if (!this->is_connected()) {
     ESP_LOGD(TAG, "start: deferring out=%u until WS connects", (unsigned) out);
-    // ensure we are actively trying to connect
     if (!pending_connect_) this->connect();
     return;
   }
@@ -244,20 +328,12 @@ void WsDdpControl::set_hw(uint8_t out, const std::string &hw) {
   shadow_hw_[out] = hw;
   if (active_[out] && this->is_connected()) this->send_update_(out);
 }
-
-static inline void append_json_str(std::string &dst, const char *key, const std::string &val) {
-  dst += "\""; dst += key; dst += "\":\""; dst += val; dst += "\"";
-}
-static inline void append_json_int(std::string &dst, const char *key, long long v) {
-  dst += "\""; dst += key; dst += "\":"; dst += std::to_string(v);
-}
-static inline void append_json_float(std::string &dst, const char *key, double v) {
-  char buf[64]; snprintf(buf, sizeof(buf), "\"%s\":%.6f", key, v); dst += buf;
-}
-static inline void append_json_bool(std::string &dst, const char *key, bool v) {
-  dst += "\""; dst += key; dst += "\":"; dst += (v ? "true" : "false");
+void WsDdpControl::set_format(uint8_t out, const std::string &fmt) {
+  shadow_format_[out] = fmt;
+  if (active_[out] && this->is_connected()) this->send_update_(out);
 }
 
+// --------- size/fmt/escape helpers ----------
 std::string WsDdpControl::json_escape_(const std::string &s) {
   std::string o; o.reserve(s.size()+8);
   for (char c: s) {
@@ -295,86 +371,62 @@ void WsDdpControl::resolve_size_(uint8_t out, int *w, int *h) const {
   if (h) *h = (H > 0 ? H : 0);
 }
 
-void WsDdpControl::start_(uint8_t out) {
-  if (!client_ || !running_) return;
+// Produce a fully-resolved config for a given output (YAML + overrides + ddp)
+WsDdpControl::StreamCfg WsDdpControl::compute_stream_cfg_(uint8_t out) const {
+  StreamCfg e{};
 
+  // size + port
+  this->resolve_size_(out, &e.w, &e.h);
+  e.ddp_port = ddp_ ? ddp_->get_port() : 4048;
+
+  // look up base cfg (may be absent if caller validates separately)
   auto oit = outputs_.find(out);
-  if (oit == outputs_.end()) { ESP_LOGW(TAG, "start: unknown out=%u", out); return; }
-  const auto &o = oit->second;
+  const OutCfg *o = (oit != outputs_.end()) ? &oit->second : nullptr;
 
-  int w=0, h=0;
-  this->resolve_size_(out, &w, &h);
+  // strings first (escaped)
+  const std::string src_in = (shadow_src_.count(out) ? shadow_src_.at(out) : (o ? o->src_const : ""));
+  const std::string hw_in  = (shadow_hw_.count(out)  ? shadow_hw_.at(out)  : (o ? o->hw_const  : "auto"));
+  e.src = json_escape_(src_in);
+  e.hw  = json_escape_(hw_in);
 
-  std::string src = shadow_src_.count(out) ? shadow_src_.at(out) : o.src_const;
-  std::string hw  = shadow_hw_.count(out)  ? shadow_hw_.at(out)  : o.hw_const;
+  // numeric/toggles
+  e.pace   = shadow_pace_.count(out)   ? shadow_pace_.at(out)   : (o ? o->pace   : 0);
+  e.ema    = shadow_ema_.count(out)    ? shadow_ema_.at(out)    : (o ? o->ema    : 0.0f);
+  e.expand = shadow_expand_.count(out) ? shadow_expand_.at(out) : (o ? o->expand : 1);
+  e.loop   = shadow_loop_.count(out)   ? shadow_loop_.at(out)   : (o ? o->loop   : true);
 
-  int   pace   = shadow_pace_.count(out)   ? shadow_pace_.at(out)   : o.pace;
-  float ema    = shadow_ema_.count(out)    ? shadow_ema_.at(out)    : o.ema;
-  int   expand = shadow_expand_.count(out) ? shadow_expand_.at(out) : o.expand;
-  bool  loop   = shadow_loop_.count(out)   ? shadow_loop_.at(out)   : o.loop;
+  // format → (fmt,pixcfg)
+  const std::string fmt_in = shadow_format_.count(out)
+      ? shadow_format_.at(out) : (o ? o->format_const : "rgb888");
+  auto rp = resolve_fmt_and_pixcfg_(fmt_in, ddp_);
+  e.fmt    = rp.first;
+  e.pixcfg = rp.second;
 
-  std::string json;
-  json.reserve(256);
-  json += "{";
-  append_json_str(json, "type", "start_stream"); json += ",";
-  append_json_int(json, "out", out);             json += ",";
-  append_json_int(json, "w", w);                 json += ",";
-  append_json_int(json, "h", h);                 json += ",";
-  append_json_str(json, "src", json_escape_(src)); json += ",";
-  // ddp port comes from the sink
-  uint16_t ddp_port = ddp_ ? ddp_->get_port() : 4048;
-  append_json_int(json, "ddp_port", ddp_port);   json += ",";
-  append_json_int(json, "pace", pace);           json += ",";
-  append_json_float(json, "ema", ema);           json += ",";
-  append_json_int(json, "expand", expand);       json += ",";
-  append_json_bool(json, "loop", loop);          json += ",";
-  append_json_str(json, "hw", json_escape_(hw));
-  json += "}";
+  return e;
+}
 
-  ESP_LOGI(TAG, "tx start_stream out=%u size=%dx%d src=%s ddp_port=%u pace=%d ema=%.3f expand=%d loop=%s hw=%s",
-           (unsigned) out, w, h, src.c_str(), (unsigned) ddp_port, pace, (double) ema, expand, loop ? "true":"false", hw.c_str());
+// Single place to build/log/send "start_stream" or "update"
+void WsDdpControl::send_stream_(const char *type, uint8_t out) {
+  if (!client_ || !running_) return;
+  auto oit = outputs_.find(out);
+  if (oit == outputs_.end()) { ESP_LOGW(TAG, "%s: unknown out=%u", type, (unsigned) out); return; }
+
+  StreamCfg e = this->compute_stream_cfg_(out);
+  const std::string json = build_stream_json_(type, out, e.w, e.h, e.ddp_port,
+                                              e.src, e.fmt, e.pixcfg,
+                                              e.pace, e.ema, e.expand, e.loop, e.hw);
+  log_stream_line_(type, out, e.w, e.h, e.ddp_port,
+                   e.src, e.fmt, e.pixcfg, e.pace, e.ema, e.expand, e.loop, e.hw);
   this->send_text(json);
 }
 
+// ------------- control helpers -------------
+void WsDdpControl::start_(uint8_t out) {
+  this->send_stream_("start_stream", out);
+}
+
 void WsDdpControl::send_update_(uint8_t out) {
-  if (!client_ || !running_) return;
-
-  auto oit = outputs_.find(out);
-  if (oit == outputs_.end()) { ESP_LOGW(TAG, "update: unknown out=%u", out); return; }
-  const auto &o = oit->second;
-
-  std::string src = shadow_src_.count(out) ? shadow_src_.at(out) : o.src_const;
-  std::string hw  = shadow_hw_.count(out)  ? shadow_hw_.at(out)  : o.hw_const;
-
-  int   pace   = shadow_pace_.count(out)   ? shadow_pace_.at(out)   : o.pace;
-  float ema    = shadow_ema_.count(out)    ? shadow_ema_.at(out)    : o.ema;
-  int   expand = shadow_expand_.count(out) ? shadow_expand_.at(out) : o.expand;
-  bool  loop   = shadow_loop_.count(out)   ? shadow_loop_.at(out)   : o.loop;
-
-  // include w/h and ddp_port so server.update_stream can safely reissue start_stream
-  int w=0, h=0;
-  this->resolve_size_(out, &w, &h);
-  uint16_t ddp_port = ddp_ ? ddp_->get_port() : 4048;
-
-  std::string json;
-  json.reserve(256);
-  json += "{";
-  append_json_str(json, "type", "update"); json += ",";
-  append_json_int(json, "out", out);       json += ",";
-  append_json_int(json, "w", w);           json += ",";
-  append_json_int(json, "h", h);           json += ",";
-  append_json_int(json, "ddp_port", ddp_port); json += ",";
-  append_json_str(json, "src", json_escape_(src)); json += ",";
-  append_json_int(json, "pace", pace);     json += ",";
-  append_json_float(json, "ema", ema);     json += ",";
-  append_json_int(json, "expand", expand); json += ",";
-  append_json_bool(json, "loop", loop);    json += ",";
-  append_json_str(json, "hw", json_escape_(hw));
-  json += "}";
-
-  ESP_LOGI(TAG, "tx update out=%u w=%d h=%d ddp_port=%u src=%s pace=%d ema=%.3f expand=%d loop=%s hw=%s",
-           (unsigned) out, w, h, (unsigned) ddp_port, src.c_str(), pace, (double) ema, expand, loop ? "true":"false", hw.c_str());
-  this->send_text(json);
+  this->send_stream_("update", out);
 }
 
 void WsDdpControl::stop_(uint8_t out) {

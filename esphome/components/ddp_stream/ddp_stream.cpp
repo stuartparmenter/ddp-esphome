@@ -145,6 +145,7 @@ void DdpStream::setup() {
 void DdpStream::dump_config() {
   ESP_LOGCONFIG(TAG, "DDP stream:");
   ESP_LOGCONFIG(TAG, "  UDP port: %u", port_);
+
   for (auto &kv : bindings_) {
     const Binding &b = kv.second;
     ESP_LOGCONFIG(TAG, "  stream id %u -> %dx%d canvas=%p (buf_px=%u) back_buffers=%u",
@@ -175,30 +176,37 @@ void DdpStream::loop() {
     }
 
     // If any mode requested an invalidate, do it here (safe w.r.t LVGL refresh)
+    bool did_present = false;
     if (b.need_invalidate.exchange(false)) {
-      if (b.canvas) lv_obj_invalidate(b.canvas);
+      if (b.canvas) {
+        lv_obj_invalidate(b.canvas);
+        did_present = true;
+      }
     }
 
 #if DDP_STREAM_METRICS
-    // queue wait time (ready -> present)
-    if (b.ready_set_us) {
-      int64_t now_us = esp_timer_get_time();
-      double qwait_ms = (double)(now_us - b.ready_set_us) / 1000.0;
-      b.qwait_ms_ewma = ewma(b.qwait_ms_ewma, qwait_ms, 0.2);
-      b.ready_set_us = 0;
-    }
+    if (did_present) {
+      // queue wait time (ready -> present)
+      if (b.ready_set_us) {
+        int64_t now_us = esp_timer_get_time();
+        double qwait_ms = (double)(now_us - b.ready_set_us) / 1000.0;
+        b.qwait_ms_ewma = ewma(b.qwait_ms_ewma, qwait_ms, 0.2);
+        b.ready_set_us = 0;
+      }
+      // present latency (first packet -> present), using the snapshot we took when queueing present
+      if (b.present_first_pkt_us != 0) {
+        int64_t now = esp_timer_get_time();
+        double lat_us = (double)(now - b.present_first_pkt_us);
+        b.present_lat_us_ewma = ewma(b.present_lat_us_ewma, lat_us);
 
-    // present latency (first packet -> present)
-    if (b.frame_seen_any && b.frame_first_pkt_us != 0) {
-      int64_t now = esp_timer_get_time();
-      double lat_us = (double)(now - b.frame_first_pkt_us);
-      b.present_lat_us_ewma = ewma(b.present_lat_us_ewma, lat_us);
-      b.frame_seen_any = false;
-      b.frame_first_pkt_us = 0;
+        // clear both: we've accounted this frame
+        b.present_first_pkt_us = 0;
+        b.frame_seen_any = false;
+        b.frame_first_pkt_us = 0;
+      }
+      b.frames_presented += 1;
+      b.win_frames_presented += 1;
     }
-
-    b.frames_presented += 1;
-    b.win_frames_presented += 1;
 #endif
   }
 
@@ -216,7 +224,8 @@ void DdpStream::loop() {
 
       double push_fps = b.win_frames_push / dt_s;
       double pres_fps = b.win_frames_presented / dt_s;
-      double rx_mbps  = (b.win_rx_bytes * 8.0) / (dt_s * 1e6);
+      double rx_mbps      = (b.win_rx_bytes * 8.0) / (dt_s * 1e6);
+      double rx_wire_mbps = (b.win_rx_wire_bytes * 8.0) / (dt_s * 1e6);
       double cov_pct  = b.coverage_ewma * 100.0;
       double lat_ms   = b.present_lat_us_ewma / 1000.0;
       double qwait_ms = b.qwait_ms_ewma;
@@ -225,14 +234,15 @@ void DdpStream::loop() {
         : 0.0;
 
       ESP_LOGI(TAG,
-        "id=%u rx_pkts=%llu rx_B=%llu win{push=%.1ffps pres=%.1ffps rx=%.2fMb/s pkt_gap=%u overrun=%u} "
-        "tot{push=%u pres=%u overrun=%u} cov(avg)=%.1f%% build(avg)=%.1f ms lat(avg)=%.1f ms qwait(avg)=%.1f ms rx_slc{wakeups=%u pkts/burst=%.2f}",
+        "id=%u rx_pkts=%llu rx_B=%llu win{push=%.1ffps pres=%.1ffps rx=%.2fMb/s wire=%.2fMb/s pkt_gap=%u overrun=%u} "
+        "tot{push=%u pres=%u overrun=%u} cov(avg)=%.1f%% build(avg)=%.1f ms lat(avg)=%.1f ms qwait(avg)=%.1f ms intra(max)=%.1f ms "
+        "rx_slc{wakeups=%u pkts/burst=%.2f}",
         (unsigned)id,
         (unsigned long long)b.rx_pkts,
         (unsigned long long)b.rx_bytes,
-        push_fps, pres_fps, rx_mbps, b.win_pkt_gap, b.win_overrun,
+        push_fps, pres_fps, rx_mbps, rx_wire_mbps, b.win_pkt_gap, b.win_overrun,
         b.frames_push, b.frames_presented, b.frames_overrun,
-        cov_pct, b.build_ms_ewma, lat_ms, qwait_ms,
+        cov_pct, b.build_ms_ewma, lat_ms, qwait_ms, b.intra_ms_max,
         b.rx_wakeups, pkts_per_wakeup
       );
 
@@ -242,8 +252,10 @@ void DdpStream::loop() {
       b.win_frames_push = 0;
       b.win_frames_presented = 0;
       b.win_rx_bytes = 0;
+      b.win_rx_wire_bytes = 0;
       b.win_pkt_gap = 0;
       b.win_overrun = 0;
+      b.intra_ms_max = 0.0;
       b.log_t0_us = now;
     }
   }
@@ -341,12 +353,29 @@ void DdpStream::recv_task() {
       const int MAX_SLICE_US       = 4500;  // tolerate ragged Wi‑Fi bursts
       int handled = 0;
       int64_t slice_start = esp_timer_get_time();
+      // Attribute per-slice stats to only the bindings that actually received packets
+      std::map<Binding*, uint32_t> slice_counts;
 
       while (handled < MAX_PKTS_PER_SLICE) {
         ssize_t n = ::recv(s, buf.data(), buf.size(), MSG_DONTWAIT);
         if (n > 0) {
           this->handle_packet_(buf.data(), (size_t)n);
 
+#if DDP_STREAM_METRICS
+          // Attribute bytes/packet to the bound stream if possible.
+          if ((size_t)n >= sizeof(DdpHeader)) {
+            const DdpHeader* h = reinterpret_cast<const DdpHeader*>(buf.data());
+            uint16_t len = ntohs(h->length_be); // pixel payload
+            if (Binding *b = this->find_binding_(h->id)) {
+              b->rx_pkts          += 1;
+              b->rx_bytes         += (uint64_t)len;
+              b->win_rx_bytes     += (uint64_t)len;
+              b->rx_wire_bytes    += (uint64_t)n;
+              b->win_rx_wire_bytes+= (uint64_t)n;
+              slice_counts[b]     += 1;
+            }
+          }
+#endif
           // Only break if THIS packet was a PUSH (end of frame).
           if ((size_t)n >= sizeof(DdpHeader)) {
             const DdpHeader* h = reinterpret_cast<const DdpHeader*>(buf.data());
@@ -365,11 +394,12 @@ void DdpStream::recv_task() {
       }
 
 #if DDP_STREAM_METRICS
-      for (auto &kv : bindings_) {
-        Binding &b = kv.second;
-        if (!b.bound) continue;
-        b.rx_wakeups += 1;
-        b.rx_pkts_in_slices += (uint64_t)handled;
+      for (auto &kvb : slice_counts) {
+        Binding *b = kvb.first;
+        uint32_t cnt = kvb.second;
+        if (!b) continue;
+        b->rx_wakeups += 1;
+        b->rx_pkts_in_slices += (uint64_t)cnt;
       }
 #endif
       taskYIELD();
@@ -484,7 +514,7 @@ void DdpStream::on_canvas_size_changed_(lv_event_t *e) {
   }
 }
 
-// -------- DDP decoder --------
+// -------- DDP decoder (dispatcher + helpers) --------
 
 void DdpStream::handle_packet_(const uint8_t *raw, size_t n) {
   if (n < sizeof(DdpHeader)) return;
@@ -500,108 +530,38 @@ void DdpStream::handle_packet_(const uint8_t *raw, size_t n) {
 
   uint32_t offset = ntohl(h->offset_be);
   uint16_t len    = ntohs(h->length_be);
+  uint8_t  cfg    = h->pixcfg;
 
-  // Handle PUSH-only packet: present whatever we've accumulated
-  if (len == 0) {
-    if (push) {
-#if DDP_STREAM_METRICS
-      b->frames_push += 1;
-      b->win_frames_push += 1;
-      if (b->frame_first_pkt_us) {
-        int64_t now_us = esp_timer_get_time();
-        double build_ms = (double)(now_us - b->frame_first_pkt_us) / 1000.0;
-        b->build_ms_ewma = ewma(b->build_ms_ewma, build_ms, 0.2);
-      }
-#endif
-      if (b->back_buffers == 2) {
-        if (b->have_ready.load()) {
-#if DDP_STREAM_METRICS
-          b->frames_overrun += 1;
-          b->win_overrun += 1;
-#endif
-        }
-        if (b->accum_buf) {
-          std::swap(b->ready_buf, b->accum_buf);
-          b->have_ready.store(true);
-#if DDP_STREAM_METRICS
-          b->ready_set_us = esp_timer_get_time();
-#endif
-        }
-      } else if (b->back_buffers == 1) {
-        b->need_copy_to_front.store(true, std::memory_order_relaxed);
-        b->need_invalidate.store(true, std::memory_order_relaxed);
-      } else { // back_buffers == 0
-        b->need_invalidate.store(true, std::memory_order_relaxed);
-      }
-    }
-    return;
-  }
+  // PUSH-only packet: present whatever we've accumulated
+  if (len == 0) { if (push) handle_push_(*b, h); return; }
 
   if (sizeof(DdpHeader) + len > n) return;
-
   const uint8_t* p = raw + sizeof(DdpHeader);
 
-  if ((offset % 3) != 0 || (len % 3) != 0) return;
-
-  size_t pixel_off = offset / 3;
-  size_t px        = len / 3;
-  size_t max_px    = b->buf_px;
-  if (pixel_off >= max_px) return;
-  size_t write_px  = std::min(px, max_px - pixel_off);
-
-  // Choose destination based on buffering mode:
-  uint16_t* dst = nullptr;
-  if (b->back_buffers == 0) {
-    // write directly into front (best for single stills)
-    if (!b->front_buf) return;
-    dst = b->front_buf + pixel_off;
-  } else {
-    if (!b->accum_buf) return;
-    dst = b->accum_buf + pixel_off;
-  }
-
 #if DDP_STREAM_METRICS
+  // Start-of-frame metrics init (first data packet in frame)
   if (!b->frame_seen_any) {
     b->frames_started += 1;
     b->frame_first_pkt_us = esp_timer_get_time();
     b->frame_bytes_accum = 0;
     b->frame_px_accum = 0;
     b->frame_seen_any = true;
-    b->intra_ms_max = 0.0;       // reset per-frame metric
+    b->intra_ms_max = 0.0;
     b->last_pkt_us = 0;
   }
-
-  int64_t now_us_gap = esp_timer_get_time();
-  if (b->last_pkt_us) {
-    double gap_ms = (double)(now_us_gap - b->last_pkt_us) / 1000.0;
-    if (gap_ms > b->intra_ms_max) b->intra_ms_max = gap_ms;
-  }
-  b->last_pkt_us = now_us_gap;
-
-  b->rx_pkts += 1;
-  b->rx_bytes += len;
-  b->win_rx_bytes += len;
 #endif
 
-  const uint8_t* sp = p;
-
-#if defined(LV_COLOR_16_SWAP) && LV_COLOR_16_SWAP
-  for (size_t i = 0; i < write_px; ++i) {
-    uint16_t c = LUT_R5[sp[0]] | LUT_G6[sp[1]] | LUT_B5[sp[2]];
-    dst[i] = (uint16_t)((c >> 8) | (c << 8));
-    sp += 3;
+  // Handle payload by format
+  if (cfg == DDP_PIXCFG_RGB888) {
+    handle_rgb888_(*b, h, p, len);
+  } else if (cfg == DDP_PIXCFG_RGB565_LE || cfg == DDP_PIXCFG_RGB565_BE) {
+    handle_rgb565_(*b, h, p, len);
+  } else {
+    return; // unknown cfg; ignore
   }
-#else
-  for (size_t i = 0; i < write_px; ++i) {
-    dst[i] = (uint16_t)(LUT_R5[sp[0]] | LUT_G6[sp[1]] | LUT_B5[sp[2]]);
-    sp += 3;
-  }
-#endif
 
 #if DDP_STREAM_METRICS
-  b->frame_bytes_accum += len;
-  b->frame_px_accum    += write_px;
-
+  // Per-packet sequencing (gap detection)
   uint8_t cur_pkt = (uint8_t)(h->seq & 0x0F);
   if (b->have_last_seq_pkt) {
     uint8_t prev = b->last_seq_pkt & 0x0F;
@@ -614,32 +574,32 @@ void DdpStream::handle_packet_(const uint8_t *raw, size_t n) {
   }
   b->last_seq_pkt = cur_pkt;
   b->have_last_seq_pkt = true;
+
+  // Track max intra-packet gap (diagnostic for burstiness/Jitter)
+  int64_t nowp = esp_timer_get_time();
+  if (b->last_pkt_us != 0) {
+    double gap_ms = (double)(nowp - b->last_pkt_us) / 1000.0;
+    if (gap_ms > b->intra_ms_max) b->intra_ms_max = gap_ms;
+  }
+  b->last_pkt_us = nowp;
 #endif
 
+  // If this packet says PUSH, finalize coverage and queue for present
   if (push) {
 #if DDP_STREAM_METRICS
     b->frames_push += 1;
     b->win_frames_push += 1;
 
-    const size_t expected_bytes = b->buf_px * 3;
+    size_t expected_bytes = b->buf_px * ((cfg == DDP_PIXCFG_RGB888) ? 3 : 2);
     double cov = (expected_bytes > 0)
       ? std::min(1.0, (double)b->frame_bytes_accum / (double)expected_bytes)
       : 0.0;
     b->coverage_ewma = ewma(b->coverage_ewma, cov);
-
     const double COMPLETE_THRESH = 0.95;
     if (cov >= COMPLETE_THRESH) b->frames_ok += 1;
     else                        b->frames_incomplete += 1;
 
-    uint8_t cur_push = (uint8_t)(h->seq & 0x0F);
-    if (b->have_last_seq) {
-      uint8_t prev = b->last_seq_push & 0x0F;
-      uint8_t exp = (uint8_t)((prev + 1) & 0x0F);
-      if (cur_push != exp) b->push_seq_misses += 1;
-    }
-    b->last_seq_push = cur_push;
-    b->have_last_seq = true;
-
+    // Build time (first packet -> PUSH)
     if (b->frame_first_pkt_us) {
       int64_t now_us = esp_timer_get_time();
       double build_ms = (double)(now_us - b->frame_first_pkt_us) / 1000.0;
@@ -658,7 +618,6 @@ void DdpStream::handle_packet_(const uint8_t *raw, size_t n) {
     if (b->back_buffers == 2) {
       std::swap(b->ready_buf, b->accum_buf);
       b->have_ready.store(true);
-      // copy happens in loop(); invalidate after copy
     } else if (b->back_buffers == 1) {
       b->need_copy_to_front.store(true, std::memory_order_relaxed);
       b->need_invalidate.store(true, std::memory_order_relaxed);
@@ -666,9 +625,141 @@ void DdpStream::handle_packet_(const uint8_t *raw, size_t n) {
       b->need_invalidate.store(true, std::memory_order_relaxed);
     }
 #if DDP_STREAM_METRICS
-    b->ready_set_us = esp_timer_get_time();
+  b->ready_set_us = esp_timer_get_time();
+  // Remember when the frame actually started, to compute present latency later.
+  if (b->frame_first_pkt_us) b->present_first_pkt_us = b->frame_first_pkt_us;
 #endif
   }
+}
+
+// Present path used by PUSH-only packets
+void DdpStream::handle_push_(Binding &b, const DdpHeader* h) {
+#if DDP_STREAM_METRICS
+  b.frames_push += 1;
+  b.win_frames_push += 1;
+  if (b.frame_first_pkt_us) {
+    int64_t now_us = esp_timer_get_time();
+    double build_ms = (double)(now_us - b.frame_first_pkt_us) / 1000.0;
+    b.build_ms_ewma = ewma(b.build_ms_ewma, build_ms, 0.2);
+  }
+#endif
+
+  if (b.back_buffers == 2) {
+    if (b.have_ready.load()) {
+#if DDP_STREAM_METRICS
+      b.frames_overrun += 1;
+      b.win_overrun += 1;
+#endif
+    }
+    if (b.accum_buf) {
+      std::swap(b.ready_buf, b.accum_buf);
+      b.have_ready.store(true);
+#if DDP_STREAM_METRICS
+      b.ready_set_us = esp_timer_get_time();
+      if (b.frame_first_pkt_us) b.present_first_pkt_us = b.frame_first_pkt_us;
+#endif
+    }
+  } else if (b.back_buffers == 1) {
+    b.need_copy_to_front.store(true, std::memory_order_relaxed);
+    b.need_invalidate.store(true, std::memory_order_relaxed);
+#if DDP_STREAM_METRICS
+    b.ready_set_us = esp_timer_get_time();
+    if (b.frame_first_pkt_us) b.present_first_pkt_us = b.frame_first_pkt_us;
+#endif
+  } else { // 0
+    b.need_invalidate.store(true, std::memory_order_relaxed);
+#if DDP_STREAM_METRICS
+    b.ready_set_us = esp_timer_get_time();
+    if (b.frame_first_pkt_us) b.present_first_pkt_us = b.frame_first_pkt_us;
+#endif
+  }
+}
+
+// RGB888 -> RGB565 (dst is canvas/native 565)
+void DdpStream::handle_rgb888_(Binding &b, const DdpHeader* h, const uint8_t* p, size_t len) {
+  if ((ntohl(h->offset_be) % 3) != 0 || (len % 3) != 0) return;
+
+  size_t pixel_off = ntohl(h->offset_be) / 3;
+  size_t px        = len / 3;
+  size_t max_px    = b.buf_px;
+  if (pixel_off >= max_px) return;
+  size_t write_px  = std::min(px, max_px - pixel_off);
+
+  uint16_t* dst = nullptr;
+  if (b.back_buffers == 0) {
+    if (!b.front_buf) return;
+    dst = b.front_buf + pixel_off;
+  } else {
+    if (!b.accum_buf) return;
+    dst = b.accum_buf + pixel_off;
+  }
+
+  const uint8_t* sp = p;
+#if defined(LV_COLOR_16_SWAP) && LV_COLOR_16_SWAP
+  for (size_t i = 0; i < write_px; ++i) {
+    uint16_t c = LUT_R5[sp[0]] | LUT_G6[sp[1]] | LUT_B5[sp[2]];
+    dst[i] = (uint16_t)((c >> 8) | (c << 8));
+    sp += 3;
+  }
+#else
+  for (size_t i = 0; i < write_px; ++i) {
+    dst[i] = (uint16_t)(LUT_R5[sp[0]] | LUT_G6[sp[1]] | LUT_B5[sp[2]]);
+    sp += 3;
+  }
+#endif
+
+#if DDP_STREAM_METRICS
+  b.frame_bytes_accum += len;
+  b.frame_px_accum    += write_px;
+#endif
+}
+
+// RGB565 passthrough with explicit byte-wise swap on mismatch
+void DdpStream::handle_rgb565_(Binding &b, const DdpHeader* h, const uint8_t* p, size_t len) {
+  if ((ntohl(h->offset_be) % 2) != 0 || (len % 2) != 0) return;
+
+  size_t pixel_off = ntohl(h->offset_be) / 2;
+  size_t px        = len / 2;
+  size_t max_px    = b.buf_px;
+  if (pixel_off >= max_px) return;
+  size_t write_px  = std::min(px, max_px - pixel_off);
+
+  uint16_t* dst = nullptr;
+  if (b.back_buffers == 0) {
+    if (!b.front_buf) return;
+    dst = b.front_buf + pixel_off;
+  } else {
+    if (!b.accum_buf) return;
+    dst = b.accum_buf + pixel_off;
+  }
+
+  const bool src_be = (h->pixcfg == DDP_PIXCFG_RGB565_BE);
+  const bool want_be =
+#if defined(LV_COLOR_16_SWAP) && LV_COLOR_16_SWAP
+    true;
+#else
+    false;
+#endif
+
+  const uint8_t* sp = p;
+  if (src_be == want_be) {
+    // Byte order matches LV canvas memory: memcpy fast path.
+    std::memcpy(dst, sp, write_px * sizeof(uint16_t));
+  } else {
+    ESP_LOGW(TAG, "Mismatch of rgb565 endian format, using slow path");
+    // Swap bytes explicitly to match LVGL canvas memory order.
+    uint8_t *d8 = reinterpret_cast<uint8_t*>(dst);
+    for (size_t i = 0; i < write_px; ++i) {
+      d8[2*i + 0] = sp[1];  // low-address byte
+      d8[2*i + 1] = sp[0];  // high-address byte
+      sp += 2;
+    }
+  }
+
+#if DDP_STREAM_METRICS
+  b.frame_bytes_accum += len;
+  b.frame_px_accum    += write_px;
+#endif
 }
 
 } // namespace ddp_stream

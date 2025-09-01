@@ -43,7 +43,8 @@ class WsDdpControl : public Component {
 
   // ------------- control API -------------
   void add_output(uint8_t id, int w, int h, const std::string &src_const,
-                  int pace, float ema, int expand, bool loop, const std::string &hw_const);
+                  int pace, float ema, int expand, bool loop,
+                  const std::string &hw_const, const std::string &format_const);
 
   void start(uint8_t out);
   void stop(uint8_t out);
@@ -54,6 +55,7 @@ class WsDdpControl : public Component {
   void set_expand(uint8_t out, int expand);
   void set_loop(uint8_t out, bool loop);
   void set_hw(uint8_t out, const std::string &hw);
+  void set_format(uint8_t out, const std::string &fmt);
 
   // ESPHome
   void setup() override {}
@@ -69,6 +71,9 @@ class WsDdpControl : public Component {
   std::string device_id_() const { return dev_id_fn_ ? dev_id_fn_() : dev_id_const_; }
   void send_hello_();
 
+  // unified send for start/update
+  void send_stream_(const char *type, uint8_t out);
+
   // control helpers
   void start_(uint8_t out);
   void send_update_(uint8_t out);
@@ -78,6 +83,16 @@ class WsDdpControl : public Component {
 
   // resolve width/height: explicit override or auto from ddp canvas
   void resolve_size_(uint8_t out, int *w, int *h) const;
+
+  // A fully resolved, ready-to-transmit stream config (YAML + runtime overrides + ddp info)
+  struct StreamCfg {
+    int w{0}, h{0};
+    uint16_t ddp_port{4048};
+    std::string src, hw, fmt;
+    uint8_t pixcfg{ddp_stream::DDP_PIXCFG_RGB888};
+    int pace{0}; float ema{0.0f}; int expand{1}; bool loop{true};
+  };
+  StreamCfg compute_stream_cfg_(uint8_t out) const;
 
   // config (templatable)
   std::string ws_host_const_;
@@ -96,7 +111,7 @@ class WsDdpControl : public Component {
   // ws state
   void *client_{nullptr};
   bool running_{false};
-  bool connecting_{false};      // NEW: prevent double connects
+  bool connecting_{false};      // prevent double connects
   bool pending_connect_{false};
   std::function<void()> on_connected_{};
 
@@ -109,6 +124,7 @@ class WsDdpControl : public Component {
     int expand{1};
     bool loop{true};
     std::string hw_const{"auto"};
+    std::string format_const{"rgb888"};  // "rgb888","rgb565","rgb565le","rgb565be"
   };
   std::map<uint8_t, OutCfg> outputs_;
   std::map<uint8_t, bool>   active_;
@@ -119,6 +135,7 @@ class WsDdpControl : public Component {
   std::map<uint8_t, float>       shadow_ema_;
   std::map<uint8_t, int>         shadow_expand_;
   std::map<uint8_t, bool>        shadow_loop_;
+  std::map<uint8_t, std::string> shadow_format_;
 };
 
 }}  // namespace esphome::ws_ddp_control
