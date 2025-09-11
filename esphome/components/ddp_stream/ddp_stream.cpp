@@ -14,6 +14,8 @@ namespace esphome {
 namespace ddp_stream {
 
 static const char* TAG = "ddp_stream";
+static_assert(LV_COLOR_DEPTH == 16 || LV_COLOR_DEPTH == 32, "LV_COLOR_DEPTH must be 16 or 32");
+static constexpr size_t BYTES_PER_PIXEL = LV_COLOR_DEPTH / 8;
 
 #ifndef DDP_STREAM_METRICS
 #define DDP_STREAM_METRICS 1
@@ -34,10 +36,6 @@ static inline void init_rgb_luts_once() {
     LUT_B5[i] = (uint16_t)( i >> 3);
   }
   LUT_INITD = true;
-}
-
-static inline void canvas_set_buf_rgb565(lv_obj_t* canvas, void* data, int w, int h) {
-  lv_canvas_set_buffer(canvas, data, (lv_coord_t)w, (lv_coord_t)h, LV_IMG_CF_TRUE_COLOR);
 }
 
 #if DDP_STREAM_METRICS
@@ -162,7 +160,7 @@ void DdpStream::loop() {
       if (!b.have_ready.exchange(false)) continue;
       if (!b.canvas || b.buf_px == 0) continue;
       if (b.buf_px && b.front_buf && b.ready_buf) {
-        std::memcpy(b.front_buf, b.ready_buf, b.buf_px * sizeof(uint16_t));
+        std::memcpy(b.front_buf, b.ready_buf, b.buf_px * BYTES_PER_PIXEL);
       }
       b.need_invalidate.store(true, std::memory_order_relaxed);
     }
@@ -170,7 +168,7 @@ void DdpStream::loop() {
     // Double-buffer path: do memcpy on the LVGL/main thread
     if (b.back_buffers == 1 && b.need_copy_to_front.exchange(false)) {
       if (b.front_buf && b.accum_buf && b.buf_px) {
-        std::memcpy(b.front_buf, b.accum_buf, b.buf_px * sizeof(uint16_t));
+        std::memcpy(b.front_buf, b.accum_buf, b.buf_px * BYTES_PER_PIXEL);
       }
       b.need_invalidate.store(true, std::memory_order_relaxed);
     }
@@ -465,7 +463,7 @@ void DdpStream::ensure_binding_buffers_(Binding &b) {
     free_ready_accum_(b);
     b.buf_px = px;
   }
-  size_t bytes = px * sizeof(uint16_t);
+  size_t bytes = px * BYTES_PER_PIXEL;
   if (b.back_buffers == 2 && !b.ready_buf) {
     b.ready_buf = static_cast<uint16_t*>(lv_mem_alloc(bytes));
     if (!b.ready_buf) { free_ready_accum_(b); b.buf_px = 0; return; }
@@ -685,25 +683,36 @@ void DdpStream::handle_rgb888_(Binding &b, const DdpHeader* h, const uint8_t* p,
   if (pixel_off >= max_px) return;
   size_t write_px  = std::min(px, max_px - pixel_off);
 
-  uint16_t* dst = nullptr;
-  if (b.back_buffers == 0) {
-    if (!b.front_buf) return;
-    dst = b.front_buf + pixel_off;
-  } else {
-    if (!b.accum_buf) return;
-    dst = b.accum_buf + pixel_off;
-  }
-
+#if LV_COLOR_DEPTH == 16
+  uint16_t* dst = (b.back_buffers == 0) ? (b.front_buf + pixel_off)
+                                        : (b.accum_buf ? b.accum_buf + pixel_off : nullptr);
+  if (!dst) return;
   const uint8_t* sp = p;
-#if defined(LV_COLOR_16_SWAP) && LV_COLOR_16_SWAP
+  #if defined(LV_COLOR_16_SWAP) && LV_COLOR_16_SWAP
+    for (size_t i = 0; i < write_px; ++i) {
+      uint16_t c = LUT_R5[sp[0]] | LUT_G6[sp[1]] | LUT_B5[sp[2]];
+      dst[i] = (uint16_t)((c >> 8) | (c << 8));
+      sp += 3;
+    }
+  #else
+    for (size_t i = 0; i < write_px; ++i) {
+      dst[i] = (uint16_t)(LUT_R5[sp[0]] | LUT_G6[sp[1]] | LUT_B5[sp[2]]);
+      sp += 3;
+    }
+  #endif
+#elif LV_COLOR_DEPTH == 32
+  if ((b.back_buffers == 0 && !b.front_buf) || (b.back_buffers != 0 && !b.accum_buf)) return;
+  lv_color32_t* dst32 = reinterpret_cast<lv_color32_t*>(
+      (b.back_buffers == 0) ? b.front_buf : b.accum_buf);
+  dst32 += pixel_off;
+  const uint8_t* sp = p;
   for (size_t i = 0; i < write_px; ++i) {
-    uint16_t c = LUT_R5[sp[0]] | LUT_G6[sp[1]] | LUT_B5[sp[2]];
-    dst[i] = (uint16_t)((c >> 8) | (c << 8));
-    sp += 3;
-  }
-#else
-  for (size_t i = 0; i < write_px; ++i) {
-    dst[i] = (uint16_t)(LUT_R5[sp[0]] | LUT_G6[sp[1]] | LUT_B5[sp[2]]);
+    lv_color32_t c;
+    c.ch.red   = sp[0];
+    c.ch.green = sp[1];
+    c.ch.blue  = sp[2];
+    c.ch.alpha = 0xFF;
+    dst32[i] = c;
     sp += 3;
   }
 #endif
@@ -724,37 +733,50 @@ void DdpStream::handle_rgb565_(Binding &b, const DdpHeader* h, const uint8_t* p,
   if (pixel_off >= max_px) return;
   size_t write_px  = std::min(px, max_px - pixel_off);
 
-  uint16_t* dst = nullptr;
-  if (b.back_buffers == 0) {
-    if (!b.front_buf) return;
-    dst = b.front_buf + pixel_off;
-  } else {
-    if (!b.accum_buf) return;
-    dst = b.accum_buf + pixel_off;
-  }
-
+#if LV_COLOR_DEPTH == 16
+  uint16_t* dst = (b.back_buffers == 0) ? (b.front_buf + pixel_off)
+                                        : (b.accum_buf ? b.accum_buf + pixel_off : nullptr);
+  if (!dst) return;
   const bool src_be = (h->pixcfg == DDP_PIXCFG_RGB565_BE);
   const bool want_be =
-#if defined(LV_COLOR_16_SWAP) && LV_COLOR_16_SWAP
-    true;
-#else
-    false;
-#endif
-
+  #if defined(LV_COLOR_16_SWAP) && LV_COLOR_16_SWAP
+      true;
+  #else
+      false;
+  #endif
   const uint8_t* sp = p;
   if (src_be == want_be) {
-    // Byte order matches LV canvas memory: memcpy fast path.
-    std::memcpy(dst, sp, write_px * sizeof(uint16_t));
+    std::memcpy(dst, sp, write_px * BYTES_PER_PIXEL);
   } else {
     ESP_LOGW(TAG, "Mismatch of rgb565 endian format, using slow path");
-    // Swap bytes explicitly to match LVGL canvas memory order.
     uint8_t *d8 = reinterpret_cast<uint8_t*>(dst);
     for (size_t i = 0; i < write_px; ++i) {
-      d8[2*i + 0] = sp[1];  // low-address byte
-      d8[2*i + 1] = sp[0];  // high-address byte
+      d8[2*i + 0] = sp[1];
+      d8[2*i + 1] = sp[0];
       sp += 2;
     }
   }
+#elif LV_COLOR_DEPTH == 32
+  if ((b.back_buffers == 0 && !b.front_buf) || (b.back_buffers != 0 && !b.accum_buf)) return;
+  lv_color32_t* dst32 = reinterpret_cast<lv_color32_t*>(
+      (b.back_buffers == 0) ? b.front_buf : b.accum_buf);
+  dst32 += pixel_off;
+  const bool src_be = (h->pixcfg == DDP_PIXCFG_RGB565_BE);
+  const uint8_t* sp = p;
+  for (size_t i = 0; i < write_px; ++i) {
+    uint16_t v = src_be ? (uint16_t)((sp[0] << 8) | sp[1]) : (uint16_t)((sp[1] << 8) | sp[0]);
+    uint8_t r5 = (uint8_t)((v >> 11) & 0x1F);
+    uint8_t g6 = (uint8_t)((v >> 5)  & 0x3F);
+    uint8_t b5 = (uint8_t)( v        & 0x1F);
+    lv_color32_t c;
+    c.ch.red   = (uint8_t)((r5 << 3) | (r5 >> 2));
+    c.ch.green = (uint8_t)((g6 << 2) | (g6 >> 4));
+    c.ch.blue  = (uint8_t)((b5 << 3) | (b5 >> 2));
+    c.ch.alpha = 0xFF;
+    dst32[i] = c;
+    sp += 2;
+  }
+#endif
 
 #if DDP_STREAM_METRICS
   b.frame_bytes_accum += len;
