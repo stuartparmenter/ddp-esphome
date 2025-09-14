@@ -31,7 +31,11 @@ OUTPUT_SCHEMA = cv.Schema({
     cv.Optional("pace", default=0): cv.int_range(min=0, max=240),
     cv.Optional("ema", default=0.0): cv.float_range(min=0.0, max=1.0),
     # expand: 0=never, 1=auto, 2=force
-    cv.Optional("expand", default="auto"): cv.one_of(0, 1, 2, "never", "auto", "force", lower=True),
+    # Accept ints and aliases, plus numeric strings ("0","1","2")
+    cv.Optional("expand", default="auto"): cv.Any(
+        cv.int_range(min=0, max=2),
+        cv.one_of("never", "auto", "force", "0", "1", "2", lower=True),
+    ),
     cv.Optional("loop", default=True): cv.boolean,
     cv.Optional("hw", default="auto"): cv.one_of(
         "auto", "none", "cuda", "qsv", "vaapi", "videotoolbox", "d3d11va", lower=True
@@ -76,7 +80,16 @@ async def to_code(config):
     # Outputs with optional explicit w/h (pass -1 to auto-detect)
     for s in config[CONF_OUTPUTS]:
         exp = s.get("expand", "auto")
-        exp_i = 1 if isinstance(exp, str) and exp.lower() == "auto" else (2 if exp in (2, "force") else 0)
+        # normalize expand → 0/1/2
+        if isinstance(exp, (int, float)):
+            exp_i = max(0, min(2, int(exp)))
+        else:
+            e = str(exp).strip().lower()
+            if e in ("never", "0"):   exp_i = 0
+            elif e in ("auto",  "1"): exp_i = 1
+            elif e in ("force", "2"): exp_i = 2
+            else:                     exp_i = 1
+
         cg.add(var.add_output(
             s["id"],
             s.get("width", -1),
