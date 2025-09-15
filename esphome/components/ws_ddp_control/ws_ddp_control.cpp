@@ -422,6 +422,18 @@ void WsDdpControl::send_stream_(const char *type, uint8_t out) {
 
 // ------------- control helpers -------------
 void WsDdpControl::start_(uint8_t out) {
+  // If size isn't known yet, defer briefly and retry.
+  StreamCfg e = this->compute_stream_cfg_(out);
+  if (e.w == 0 || e.h == 0) {
+    ESP_LOGD(TAG, "start_stream out=%u deferred: size not ready (w=%d h=%d)",
+             (unsigned) out, e.w, e.h);
+    this->set_timeout(200, [this, out]() {
+      // only retry if still active and connected
+      if (this->active_[out] && this->is_connected()) this->start_(out);
+    });
+    return;
+  }
+  // Size is known: send the real start now.
   this->send_stream_("start_stream", out);
 }
 
