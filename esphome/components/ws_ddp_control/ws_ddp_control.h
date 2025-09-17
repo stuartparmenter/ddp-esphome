@@ -8,6 +8,7 @@
 #include <map>
 #include <functional>
 #include <string>
+#include <optional>
 
 extern "C" {
   #include "esp_event.h"
@@ -42,9 +43,7 @@ class WsDdpControl : public Component {
   void set_on_connected(std::function<void()> cb){ on_connected_ = std::move(cb); }
 
   // ------------- control API -------------
-  void add_output(uint8_t id, int w, int h, const std::string &src_const,
-                  int pace, float ema, int expand, bool loop,
-                  const std::string &hw_const, const std::string &format_const);
+  void add_output_basic(uint8_t id, int w, int h);
 
   void start(uint8_t out);
   void stop(uint8_t out);
@@ -88,9 +87,14 @@ class WsDdpControl : public Component {
   struct StreamCfg {
     int w{0}, h{0};
     uint16_t ddp_port{4048};
-    std::string src, hw, fmt;
-    uint8_t pixcfg{ddp_stream::DDP_PIXCFG_RGB888};
-    int pace{0}; float ema{0.0f}; int expand{1}; bool loop{true};
+    std::optional<std::string> src;
+    std::optional<std::string> hw;
+    std::optional<std::string> fmt;
+    std::optional<uint8_t>     pixcfg;
+    std::optional<int>         pace;
+    std::optional<float>       ema;
+    std::optional<int>         expand;   // 0=never,1=auto,2=force
+    std::optional<bool>        loop;
   };
   StreamCfg compute_stream_cfg_(uint8_t out) const;
 
@@ -118,24 +122,16 @@ class WsDdpControl : public Component {
   // outputs
   struct OutCfg {
     int w{-1}, h{-1};                 // -1 means "auto from canvas"
-    std::string src_const{""};
-    int pace{0};
-    float ema{0.0f};
-    int expand{1};
-    bool loop{true};
-    std::string hw_const{"auto"};
-    std::string format_const{"rgb888"};  // "rgb888","rgb565","rgb565le","rgb565be"
+    std::optional<std::string> src_const;
+    std::optional<int>         pace;
+    std::optional<float>       ema;
+    std::optional<int>         expand;        // 0/1/2
+    std::optional<bool>        loop;
+    std::optional<std::string> hw_const;      // "auto","none","cuda","qsv","vaapi","videotoolbox","d3d11va"
+    std::optional<std::string> format_const;  // "rgb888","rgb565","rgb565le","rgb565be"
   };
   std::map<uint8_t, OutCfg> outputs_;
   std::map<uint8_t, bool>   active_;
-  // shadow overrides (runtime)
-  std::map<uint8_t, std::string> shadow_src_;
-  std::map<uint8_t, std::string> shadow_hw_;
-  std::map<uint8_t, int>         shadow_pace_;
-  std::map<uint8_t, float>       shadow_ema_;
-  std::map<uint8_t, int>         shadow_expand_;
-  std::map<uint8_t, bool>        shadow_loop_;
-  std::map<uint8_t, std::string> shadow_format_;
 };
 
 }}  // namespace esphome::ws_ddp_control

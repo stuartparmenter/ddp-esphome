@@ -27,21 +27,21 @@ OUTPUT_SCHEMA = cv.Schema({
     cv.Optional("height"): cv.int_range(min=1, max=4096),
 
     # Orchestration defaults (all can be changed at runtime via setters)
-    cv.Optional("src", default=""): cv.string,
-    cv.Optional("pace", default=0): cv.int_range(min=0, max=240),
-    cv.Optional("ema", default=0.0): cv.float_range(min=0.0, max=1.0),
+    cv.Optional("src"): cv.string,
+    cv.Optional("pace"): cv.int_range(min=0, max=240),
+    cv.Optional("ema"): cv.float_range(min=0.0, max=1.0),
     # expand: 0=never, 1=auto, 2=force
     # Accept ints and aliases, plus numeric strings ("0","1","2")
-    cv.Optional("expand", default="auto"): cv.Any(
+    cv.Optional("expand"): cv.Any(
         cv.int_range(min=0, max=2),
         cv.one_of("never", "auto", "force", "0", "1", "2", lower=True),
     ),
-    cv.Optional("loop", default=True): cv.boolean,
-    cv.Optional("hw", default="auto"): cv.one_of(
+    cv.Optional("loop"): cv.boolean,
+    cv.Optional("hw"): cv.one_of(
         "auto", "none", "cuda", "qsv", "vaapi", "videotoolbox", "d3d11va", lower=True
     ),
     # Per-output transport format. 'rgb565' will auto-pick endian from the sink.
-    cv.Optional("format", default="rgb888"): cv.one_of(
+    cv.Optional("format"): cv.one_of(
         "rgb888", "rgb565", "rgb565le", "rgb565be", lower=True
     ),
 })
@@ -90,18 +90,19 @@ async def to_code(config):
             elif e in ("force", "2"): exp_i = 2
             else:                     exp_i = 1
 
-        cg.add(var.add_output(
+        cg.add(var.add_output_basic(
             s["id"],
             s.get("width", -1),
-            s.get("height", -1),
-            s.get("src", ""),
-            s.get("pace", 0),
-            s.get("ema", 0.0),
-            exp_i,
-            s.get("loop", True),
-            s.get("hw", "auto"),
-            s.get("format", "rgb888"),
+            s.get("height", -1)
         ))
+
+        if "src" in s: cg.add(var.set_src(s["id"], s["src"]))
+        if "pace" in s: cg.add(var.set_pace(s["id"], s["pace"]))
+        if "ema" in s: cg.add(var.set_ema(s["id"], s["ema"]))
+        if exp_i is not None: cg.add(var.set_expand(s["id"], exp_i))
+        if "loop" in s: cg.add(var.set_loop(s["id"], s["loop"]))
+        if "hw" in s: cg.add(var.set_hw(s["id"], s["hw"]))
+        if "format" in s: cg.add(var.set_format(s["id"], s["format"]))
 
     # Ensure esp_websocket_client is linked
     add_idf_component(name="espressif/esp_websocket_client", ref="1.5.0")
