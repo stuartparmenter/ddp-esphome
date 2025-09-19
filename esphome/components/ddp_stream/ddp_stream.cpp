@@ -302,6 +302,7 @@ void DdpStream::open_socket_() {
   }
 
   if (task_ == nullptr) {
+    task_should_exit_.store(false);
     // Higher prio + pin to opposite core from typical LVGL usage
     xTaskCreatePinnedToCore(&DdpStream::recv_task_trampoline, "ddp_rx",
                             6144, this, 6, &task_, 1);
@@ -310,11 +311,24 @@ void DdpStream::open_socket_() {
 
 void DdpStream::close_socket_() {
   if (task_ != nullptr) {
+    // Signal task to exit and close socket to break out of select()
+    task_should_exit_.store(true);
+    if (sock_ >= 0) { ::shutdown(sock_, SHUT_RDWR); ::close(sock_); sock_ = -1; }
+
+    // Wait for task to exit gracefully with timeout
     TaskHandle_t t = task_;
     task_ = nullptr;
-    if (sock_ >= 0) { ::shutdown(sock_, SHUT_RDWR); ::close(sock_); sock_ = -1; }
-    vTaskDelay(pdMS_TO_TICKS(10));
-    vTaskDelete(t);
+
+    // Give the task some time to exit cleanly
+    for (int i = 0; i < 100; i++) {
+      if (eTaskGetState(t) == eDeleted) break;
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    // Force delete if still running
+    if (eTaskGetState(t) != eDeleted) {
+      vTaskDelete(t);
+    }
   } else if (sock_ >= 0) {
     ::shutdown(sock_, SHUT_RDWR); ::close(sock_); sock_ = -1;
   }
@@ -327,14 +341,16 @@ void DdpStream::close_socket_() {
 }
 
 void DdpStream::recv_task_trampoline(void* arg) {
-  reinterpret_cast<DdpStream*>(arg)->recv_task();
+  if (arg == nullptr) return;
+  DdpStream* stream = reinterpret_cast<DdpStream*>(arg);
+  stream->recv_task();
 }
 
 void DdpStream::recv_task() {
   std::vector<uint8_t> buf(2048);
 
   while (true) {
-    if (task_ == nullptr) break;
+    if (task_should_exit_.load()) break;
     int s = sock_;
     if (s < 0) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
 
