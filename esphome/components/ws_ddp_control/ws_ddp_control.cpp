@@ -124,10 +124,11 @@ void WsDdpControl::ws_event_trampoline(void *arg,
 
   switch (event_id) {
     case WEBSOCKET_EVENT_CONNECTED:
-      if (self->running_) break;               // ignore duplicate CONNECTED
+      if (self->running_.load()) break;        // ignore duplicate CONNECTED
       ESP_LOGI(TAG, "connected");
-      self->running_ = true;
+      self->running_.store(true);
       self->connecting_ = false;
+      self->reset_backoff_();  // Reset reconnection backoff on successful connect
       self->send_hello_();
       // replay all active streams
       for (auto &kv : self->active_) if (kv.second) self->start_(kv.first);
@@ -136,12 +137,23 @@ void WsDdpControl::ws_event_trampoline(void *arg,
 
     case WEBSOCKET_EVENT_DISCONNECTED:
       ESP_LOGW(TAG, "disconnected");
-      self->running_ = false;
+      self->running_.store(false);
       self->connecting_ = false;
+      self->schedule_reconnect_();
+      break;
+
+    case WEBSOCKET_EVENT_CLOSED:
+      ESP_LOGW(TAG, "connection closed by server");
+      self->running_.store(false);
+      self->connecting_ = false;
+      self->schedule_reconnect_();
       break;
 
     case WEBSOCKET_EVENT_ERROR:
-      ESP_LOGE(TAG, "error");
+      ESP_LOGE(TAG, "connection error");
+      self->running_.store(false);
+      self->connecting_ = false;
+      self->schedule_reconnect_();
       break;
 
     default:
@@ -196,7 +208,7 @@ std::string WsDdpControl::build_uri_() const {
 
 // ------------- lifecycle -------------
 void WsDdpControl::connect() {
-  if (running_ || connecting_ || client_) return;   // idempotent
+  if (running_.load() || connecting_ || client_) return;   // idempotent
   if (!network::is_connected()) {
     ESP_LOGI(TAG, "network not ready; deferring connect");
     pending_connect_ = true;
@@ -228,7 +240,7 @@ void WsDdpControl::do_connect_() {
   esp_websocket_client_config_t cfg{};
   cfg.uri = uri.c_str();
   cfg.network_timeout_ms   = 3000;
-  cfg.reconnect_timeout_ms = 2000;
+  cfg.reconnect_timeout_ms = 0;        // Disable ESP-IDF auto-reconnect, we handle it manually
   cfg.keep_alive_enable    = true;
   cfg.keep_alive_idle      = 10;
   cfg.keep_alive_interval  = 10;
@@ -276,7 +288,7 @@ void WsDdpControl::do_connect_() {
 
 void WsDdpControl::disconnect() {
   if (!client_) {
-    running_ = false;
+    running_.store(false);
     connecting_ = false;
     pending_connect_ = false;
     return;
@@ -285,9 +297,34 @@ void WsDdpControl::disconnect() {
   esp_websocket_client_stop((esp_websocket_client_handle_t) client_);
   esp_websocket_client_destroy((esp_websocket_client_handle_t) client_);
   client_ = nullptr;
-  running_ = false;
+  running_.store(false);
   connecting_ = false;
   pending_connect_ = false;
+}
+
+void WsDdpControl::schedule_reconnect_() {
+  if (connecting_ || pending_connect_) return;  // avoid duplicate reconnects
+
+  // Clean up current client if exists
+  if (client_) {
+    esp_websocket_client_stop((esp_websocket_client_handle_t) client_);
+    esp_websocket_client_destroy((esp_websocket_client_handle_t) client_);
+    client_ = nullptr;
+  }
+
+  // Use exponential backoff, capped at 30 seconds
+  reconnect_backoff_ms_ = std::min<uint32_t>(reconnect_backoff_ms_ * 2, 30000);
+
+  ESP_LOGI(TAG, "scheduling reconnect in %ums", (unsigned)reconnect_backoff_ms_);
+  pending_connect_ = true;
+  this->set_timeout(reconnect_backoff_ms_, [this]() {
+    this->connect();
+  });
+}
+
+void WsDdpControl::reset_backoff_() {
+  // Reset backoff delay on successful connection
+  reconnect_backoff_ms_ = 1000;
 }
 
 // ------------- protocol helpers -------------
@@ -303,7 +340,7 @@ void WsDdpControl::send_hello_() {
 }
 
 void WsDdpControl::send_text(const char *json_utf8) {
-  if (!client_ || !running_) return;
+  if (!client_ || !running_.load()) return;
   if (!json_utf8 || !*json_utf8) return;
   esp_websocket_client_send_text((esp_websocket_client_handle_t) client_, json_utf8, strlen(json_utf8), portMAX_DELAY);
 }
@@ -428,7 +465,7 @@ WsDdpControl::StreamCfg WsDdpControl::compute_stream_cfg_(uint8_t out) const {
 
 // Single place to build/log/send "start_stream" or "update"
 void WsDdpControl::send_stream_(const char *type, uint8_t out) {
-  if (!client_ || !running_) return;
+  if (!client_ || !running_.load()) return;
   auto oit = outputs_.find(out);
   if (oit == outputs_.end()) { ESP_LOGW(TAG, "%s: unknown out=%u", type, (unsigned) out); return; }
 
@@ -463,7 +500,7 @@ void WsDdpControl::send_update_(uint8_t out) {
 }
 
 void WsDdpControl::stop_(uint8_t out) {
-  if (!client_ || !running_) return;
+  if (!client_ || !running_.load()) return;
   std::string json;
   json.reserve(48);
   json += "{\"type\":\"stop_stream\",\"out\":";

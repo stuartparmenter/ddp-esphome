@@ -9,6 +9,7 @@
 #include <functional>
 #include <string>
 #include <optional>
+#include <atomic>
 
 extern "C" {
   #include "esp_event.h"
@@ -35,7 +36,7 @@ class WsDdpControl : public Component {
   // ------------- lifecycle & messaging -------------
   void connect();
   void disconnect();
-  bool is_connected() const { return running_; }
+  bool is_connected() const { return running_.load(); }
   void send_text(const char *json_utf8);
   void send_text(const std::string &json_utf8) { this->send_text(json_utf8.c_str()); }
 
@@ -66,6 +67,8 @@ class WsDdpControl : public Component {
   static void ws_event_trampoline(void *arg, esp_event_base_t base, int32_t event_id, void *event_data);
 
   void do_connect_();
+  void schedule_reconnect_();
+  void reset_backoff_();
   std::string build_uri_() const;
   std::string device_id_() const { return dev_id_fn_ ? dev_id_fn_() : dev_id_const_; }
   void send_hello_();
@@ -114,9 +117,10 @@ class WsDdpControl : public Component {
 
   // ws state
   void *client_{nullptr};
-  bool running_{false};
-  bool connecting_{false};      // prevent double connects
-  bool pending_connect_{false};
+  std::atomic<bool> running_{false};    // Written from both main and event threads
+  bool connecting_{false};              // Only written from main thread
+  bool pending_connect_{false};         // Only written from main thread
+  uint32_t reconnect_backoff_ms_{1000}; // Current backoff delay
   std::function<void()> on_connected_{};
 
   // outputs
