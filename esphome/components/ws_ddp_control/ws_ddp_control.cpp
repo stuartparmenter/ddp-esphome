@@ -12,6 +12,7 @@
 extern "C" {
   #include "esp_websocket_client.h"
   #include "freertos/FreeRTOS.h"
+  #include "freertos/task.h"
 }
 
 static const char *TAG = "ws_ddp_control";
@@ -31,6 +32,15 @@ static inline void append_json_float(std::string &dst, const char *key, double v
 }
 static inline void append_json_bool(std::string &dst, const char *key, bool v) {
   dst += "\""; dst += key; dst += "\":"; dst += (v ? "true" : "false");
+}
+
+// Task to cleanup websocket client without blocking main thread
+static void cleanup_websocket_task(void *client_handle) {
+  if (client_handle) {
+    esp_websocket_client_stop((esp_websocket_client_handle_t) client_handle);
+    esp_websocket_client_destroy((esp_websocket_client_handle_t) client_handle);
+  }
+  vTaskDelete(NULL);  // Delete this cleanup task
 }
 
 // one canonical place to build the stream JSON (used by start_ and send_update_)
@@ -115,6 +125,8 @@ resolve_fmt_and_pixcfg_(const std::string &fmt_in, ddp_stream::DdpStream *ddp) {
 }
 
 // ------------- trampoline -------------
+// NOTE: This runs on ESP-IDF event task, NOT the main ESPHome thread.
+// Most operations should be deferred to main thread via set_timeout().
 void WsDdpControl::ws_event_trampoline(void *arg,
                                        esp_event_base_t /*base*/,
                                        int32_t event_id,
@@ -127,33 +139,47 @@ void WsDdpControl::ws_event_trampoline(void *arg,
       if (self->running_.load()) break;        // ignore duplicate CONNECTED
       ESP_LOGI(TAG, "connected");
       self->running_.store(true);
-      self->connecting_ = false;
-      self->reset_backoff_();  // Reset reconnection backoff on successful connect
-      self->send_hello_();
-      // replay all active streams
-      for (auto &kv : self->active_) if (kv.second) self->start_(kv.first);
-      if (self->on_connected_) self->on_connected_();
+      // push all main-thread work off the event task
+      self->set_timeout(0, [self]() {
+        self->connecting_ = false;
+        self->reset_backoff_();  // Reset reconnection backoff on successful connect
+        self->send_hello_();
+        // replay all active streams on main thread
+        for (auto &kv : self->active_) if (kv.second) self->start_(kv.first);
+      });
       break;
 
     case WEBSOCKET_EVENT_DISCONNECTED:
       ESP_LOGW(TAG, "disconnected");
-      self->running_.store(false);
-      self->connecting_ = false;
-      self->schedule_reconnect_();
+      if (self->running_.load()) {  // Only handle if we were running
+        self->running_.store(false);
+        self->set_timeout(0, [self]() {
+          self->connecting_ = false;
+          self->schedule_reconnect_();
+        });
+      }
       break;
 
     case WEBSOCKET_EVENT_CLOSED:
       ESP_LOGW(TAG, "connection closed by server");
-      self->running_.store(false);
-      self->connecting_ = false;
-      self->schedule_reconnect_();
+      if (self->running_.load()) {  // Only handle if we were running
+        self->running_.store(false);
+        self->set_timeout(0, [self]() {
+          self->connecting_ = false;
+          self->schedule_reconnect_();
+        });
+      }
       break;
 
     case WEBSOCKET_EVENT_ERROR:
       ESP_LOGE(TAG, "connection error");
-      self->running_.store(false);
-      self->connecting_ = false;
-      self->schedule_reconnect_();
+      if (self->running_.load()) {  // Only handle if we were running
+        self->running_.store(false);
+        self->set_timeout(0, [self]() {
+          self->connecting_ = false;
+          self->schedule_reconnect_();
+        });
+      }
       break;
 
     default:
@@ -210,17 +236,19 @@ std::string WsDdpControl::build_uri_() const {
 void WsDdpControl::connect() {
   if (running_.load() || connecting_ || client_) return;   // idempotent
   if (!network::is_connected()) {
-    ESP_LOGI(TAG, "network not ready; deferring connect");
+    ESP_LOGI(TAG, "network not ready; deferring connect with backoff");
     pending_connect_ = true;
-    this->set_timeout(500, [this](){ this->connect(); });
+    this->set_timeout(reconnect_backoff_ms_, [this](){ this->connect(); });
+    reconnect_backoff_ms_ = std::min<uint32_t>(reconnect_backoff_ms_ * 2, 30000);
     return;
   }
 
   const std::string uri = this->build_uri_();
   if (uri.empty()) {
-    ESP_LOGI(TAG, "URI not ready; retrying connect soon");
+    ESP_LOGI(TAG, "URI not ready; retrying connect with backoff");
     pending_connect_ = true;
-    this->set_timeout(500, [this](){ this->connect(); });
+    this->set_timeout(reconnect_backoff_ms_, [this](){ this->connect(); });
+    reconnect_backoff_ms_ = std::min<uint32_t>(reconnect_backoff_ms_ * 2, 30000);
     return;
   }
 
@@ -250,10 +278,10 @@ void WsDdpControl::do_connect_() {
   auto client = esp_websocket_client_init(&cfg);
   if (!client) {
     ESP_LOGE(TAG, "init failed");
-    static uint32_t backoff_ms = 500;
-    backoff_ms = std::min<uint32_t>(backoff_ms * 2, 10000);
+    reconnect_backoff_ms_ = std::min<uint32_t>(reconnect_backoff_ms_ * 2, 30000);
     connecting_ = false;
-    this->set_timeout(backoff_ms, [this](){ this->connect(); });
+    pending_connect_ = true;
+    this->set_timeout(reconnect_backoff_ms_, [this](){ this->connect(); });
     return;
   }
   client_ = client;
@@ -264,10 +292,10 @@ void WsDdpControl::do_connect_() {
     ESP_LOGE(TAG, "register events failed: 0x%X", (unsigned) err);
     esp_websocket_client_destroy((esp_websocket_client_handle_t) client_);
     client_ = nullptr;
-    static uint32_t backoff_ms = 500;
-    backoff_ms = std::min<uint32_t>(backoff_ms * 2, 10000);
+    reconnect_backoff_ms_ = std::min<uint32_t>(reconnect_backoff_ms_ * 2, 30000);
     connecting_ = false;
-    this->set_timeout(backoff_ms, [this](){ this->connect(); });
+    pending_connect_ = true;
+    this->set_timeout(reconnect_backoff_ms_, [this](){ this->connect(); });
     return;
   }
 
@@ -279,10 +307,10 @@ void WsDdpControl::do_connect_() {
     ESP_LOGE(TAG, "start failed: 0x%X", (unsigned) err);
     esp_websocket_client_destroy((esp_websocket_client_handle_t) client_);
     client_ = nullptr;
-    static uint32_t backoff_ms = 500;
-    backoff_ms = std::min<uint32_t>(backoff_ms * 2, 10000);
+    reconnect_backoff_ms_ = std::min<uint32_t>(reconnect_backoff_ms_ * 2, 30000);
     connecting_ = false;
-    this->set_timeout(backoff_ms, [this](){ this->connect(); });
+    pending_connect_ = true;
+    this->set_timeout(reconnect_backoff_ms_, [this](){ this->connect(); });
   }
 }
 
@@ -305,18 +333,25 @@ void WsDdpControl::disconnect() {
 void WsDdpControl::schedule_reconnect_() {
   if (connecting_ || pending_connect_) return;  // avoid duplicate reconnects
 
-  // Clean up current client if exists
-  if (client_) {
-    esp_websocket_client_stop((esp_websocket_client_handle_t) client_);
-    esp_websocket_client_destroy((esp_websocket_client_handle_t) client_);
-    client_ = nullptr;
-  }
-
   // Use exponential backoff, capped at 30 seconds
   reconnect_backoff_ms_ = std::min<uint32_t>(reconnect_backoff_ms_ * 2, 30000);
 
   ESP_LOGI(TAG, "scheduling reconnect in %ums", (unsigned)reconnect_backoff_ms_);
   pending_connect_ = true;
+
+  // Cleanup old client in background task to avoid blocking main thread
+  // esp_websocket_client_stop() can block for seconds waiting for network operations
+  void *old_client = client_;
+  client_ = nullptr;  // Clear immediately to prevent reuse
+
+  if (old_client) {
+    // Create a cleanup task that runs on a separate thread
+    TaskHandle_t cleanup_task;
+    if (xTaskCreate(cleanup_websocket_task, "ws_cleanup", 2048, old_client, 5, &cleanup_task) != pdPASS) {
+      ESP_LOGW(TAG, "failed to create cleanup task, will leak client handle");
+    }
+  }
+
   this->set_timeout(reconnect_backoff_ms_, [this]() {
     this->connect();
   });

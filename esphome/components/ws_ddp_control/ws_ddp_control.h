@@ -40,8 +40,6 @@ class WsDdpControl : public Component {
   void send_text(const char *json_utf8);
   void send_text(const std::string &json_utf8) { this->send_text(json_utf8.c_str()); }
 
-  // Optional external hook
-  void set_on_connected(std::function<void()> cb){ on_connected_ = std::move(cb); }
 
   // ------------- control API -------------
   void add_output_basic(uint8_t id, int w, int h);
@@ -118,10 +116,9 @@ class WsDdpControl : public Component {
   // ws state
   void *client_{nullptr};
   std::atomic<bool> running_{false};    // Written from both main and event threads
-  bool connecting_{false};              // Only written from main thread
-  bool pending_connect_{false};         // Only written from main thread
+  bool connecting_{false};              // Main-thread owned; event task never writes directly
+  bool pending_connect_{false};         // Main-thread owned; event task never writes directly
   uint32_t reconnect_backoff_ms_{1000}; // Current backoff delay
-  std::function<void()> on_connected_{};
 
   // outputs
   struct OutCfg {
