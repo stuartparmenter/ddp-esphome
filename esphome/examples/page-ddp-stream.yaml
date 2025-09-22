@@ -16,7 +16,7 @@ substitutions:
   OUT_ID: "1"
 
 external_components:
-  - source: github://stuartparmenter/lvgl-ddp-stream@v0.2.0
+  - source: github://stuartparmenter/lvgl-ddp-stream@main  # Use @v0.4.2 or specific version for production
     components: [ddp_stream, ws_ddp_control]
 
 # UDP DDP sink + canvas bindings (no w/h required here)
@@ -36,6 +36,7 @@ ws_ddp_control:
   id: ws
   ws_host: ${WS_DDP_HOST}
   ws_port: ${WS_DDP_PORT}
+  device_id: "esp32-ddp"        # Optional device identifier
   ddp: ddp
   outputs:
     - id: 1
@@ -43,6 +44,7 @@ ws_ddp_control:
       # width/height optional; if omitted, auto from canvas
       # width: 64
       # height: 64
+      # format: rgb888          # Optional: rgb888, rgb565, rgb565le, rgb565be
       # pace: 0
       # ema: 0.0
       # expand: auto
@@ -85,6 +87,8 @@ text:
     mode: text
     on_value:
       then:
-        - lambda: |-
-            id(ws).set_src(${OUT_ID}, x.c_str());
+        - ws_ddp_control.set_src:
+            id: ws
+            output_id: ${OUT_ID}
+            src: !lambda "return x;"
 
