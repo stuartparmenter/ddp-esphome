@@ -3,6 +3,7 @@
 
 #pragma once
 #include "esphome/core/component.h"
+#include "esphome/core/automation.h"
 #include "esphome/components/ddp_stream/ddp_stream.h"
 
 #include <map>
@@ -88,7 +89,7 @@ class WsDdpControl : public Component {
   struct StreamCfg {
     int w{0}, h{0};
     uint16_t ddp_port{4048};
-    std::optional<std::string> src;
+    std::string src;
     std::optional<std::string> hw;
     std::optional<std::string> fmt;
     std::optional<uint8_t>     pixcfg;
@@ -123,7 +124,7 @@ class WsDdpControl : public Component {
   // outputs
   struct OutCfg {
     int w{-1}, h{-1};                 // -1 means "auto from canvas"
-    std::optional<std::string> src_const;
+    std::string src_const;
     std::optional<int>         pace;
     std::optional<float>       ema;
     std::optional<int>         expand;        // 0/1/2
@@ -133,6 +134,22 @@ class WsDdpControl : public Component {
   };
   std::map<uint8_t, OutCfg> outputs_;
   std::map<uint8_t, bool>   active_;
+};
+
+template<typename... Ts> class SetSrcAction : public Action<Ts...> {
+ public:
+  SetSrcAction(WsDdpControl *parent, uint8_t output_id) : parent_(parent), output_id_(output_id) {}
+
+  TEMPLATABLE_VALUE(std::string, src)
+
+  void play(Ts... x) override {
+    std::string src = this->src_.value(x...);
+    this->parent_->set_src(output_id_, src);
+  }
+
+ protected:
+  WsDdpControl *parent_;
+  const uint8_t output_id_;
 };
 
 }}  // namespace esphome::ws_ddp_control

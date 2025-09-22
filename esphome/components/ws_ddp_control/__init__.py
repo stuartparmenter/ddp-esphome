@@ -1,7 +1,7 @@
 # © Copyright 2025 Stuart Parmenter
 # SPDX-License-Identifier: MIT
 
-from esphome import codegen as cg, config_validation as cv
+from esphome import automation, codegen as cg, config_validation as cv
 from esphome.const import CONF_ID, CONF_URL
 from esphome.components.esp32 import add_idf_component
 
@@ -19,6 +19,8 @@ CONF_WS_PORT   = "ws_port"
 CONF_DEVICE_ID = "device_id"
 CONF_DDP       = "ddp"
 CONF_OUTPUTS   = "outputs"
+CONF_OUTPUT_ID = "output_id"
+CONF_SRC       = "src"
 
 OUTPUT_SCHEMA = cv.Schema({
     cv.Required("id"): cv.int_range(min=0, max=255),
@@ -27,7 +29,7 @@ OUTPUT_SCHEMA = cv.Schema({
     cv.Optional("height"): cv.int_range(min=1, max=4096),
 
     # Orchestration defaults (all can be changed at runtime via setters)
-    cv.Optional("src"): cv.string,
+    cv.Required("src"): cv.string,
     cv.Optional("pace"): cv.int_range(min=0, max=240),
     cv.Optional("ema"): cv.float_range(min=0.0, max=1.0),
     # expand: 0=never, 1=auto, 2=force
@@ -58,6 +60,28 @@ CONFIG_SCHEMA = cv.Schema({
     cv.Required(CONF_DDP): cv.use_id(DdpStream),
     cv.Optional(CONF_OUTPUTS, default=[]): cv.ensure_list(OUTPUT_SCHEMA),
 }).extend(cv.COMPONENT_SCHEMA)
+
+# Actions
+SetSrcAction = ws_ns.class_("SetSrcAction", automation.Action)
+
+@automation.register_action(
+    "ws_ddp_control.set_src",
+    SetSrcAction,
+    cv.Schema({
+        cv.GenerateID(): cv.use_id(WsDdpControl),
+        cv.Required(CONF_OUTPUT_ID): cv.int_range(min=0, max=255),
+        cv.Required(CONF_SRC): cv.templatable(cv.string),
+    })
+)
+async def set_src_action_to_code(config, action_id, template_arg, args):
+    paren = await cg.get_variable(config[CONF_ID])
+    output_id = config[CONF_OUTPUT_ID]
+
+    # Create a specialized action class with the output_id baked in
+    var = cg.new_Pvariable(action_id, template_arg, paren, output_id)
+    src_templ = await cg.templatable(config[CONF_SRC], args, cg.std_string)
+    cg.add(var.set_src(src_templ))
+    return var
 
 def _templ(expr):
     return cg.templatable(expr, [], cg.std_string)

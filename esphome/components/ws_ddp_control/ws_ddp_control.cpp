@@ -48,7 +48,7 @@ static std::string build_stream_json_(const char *type,
                                       uint8_t out,
                                       int w, int h,
                                       uint16_t ddp_port,
-                                      const std::optional<std::string> &src,
+                                      const std::string &src,
                                       const std::optional<std::string> &fmt,
                                       const std::optional<uint8_t> &pixcfg,
                                       const std::optional<int> &pace,
@@ -63,9 +63,9 @@ static std::string build_stream_json_(const char *type,
   append_json_int(json, "out", out);        json += ",";
   append_json_int(json, "w", w);            json += ",";
   append_json_int(json, "h", h);            json += ",";
-  append_json_int(json, "ddp_port", ddp_port);
+  append_json_int(json, "ddp_port", ddp_port); json += ",";
+  append_json_str(json, "src", src);
   auto add = [&](auto fn){ json += ","; fn(); };
-  if (src)    add([&](){ append_json_str(json, "src", *src); });
   if (fmt)    add([&](){ append_json_str(json, "fmt", *fmt); });
   if (pixcfg) add([&](){ append_json_int(json, "pixcfg", (int)*pixcfg); });
   if (pace)   add([&](){ append_json_int(json, "pace", *pace); });
@@ -81,7 +81,7 @@ static void log_stream_line_(const char *label,
                              uint8_t out,
                              int w, int h,
                              uint16_t ddp_port,
-                             const std::optional<std::string> &src,
+                             const std::string &src,
                              const std::optional<std::string> &fmt,
                              const std::optional<uint8_t> &pixcfg,
                              const std::optional<int> &pace,
@@ -92,7 +92,7 @@ static void log_stream_line_(const char *label,
   ESP_LOGI(TAG, "tx %s out=%u size=%dx%d src=%s ddp_port=%u fmt=%s pixcfg=0x%02X "
                 "pace=%s ema=%s expand=%s loop=%s hw=%s",
            label,
-           (unsigned) out, w, h, (src?src->c_str():"(unset)"), (unsigned) ddp_port,
+           (unsigned) out, w, h, src.c_str(), (unsigned) ddp_port,
            (fmt?fmt->c_str():"(unset)"), (unsigned) (pixcfg?*pixcfg:0),
            (pace?std::to_string(*pace).c_str():"(unset)"),
            (ema?std::to_string(*ema).c_str():"(unset)"),
@@ -212,7 +212,7 @@ void WsDdpControl::dump_config() {
     auto boo_or = [](const std::optional<bool> &v){ return v ? (*v ? "true" : "false") : "(unset)"; };
 
     ESP_LOGCONFIG(TAG, "      src=%s pace=%s ema=%s expand=%s loop=%s hw=%s format=%s",
-                  str_or(o.src_const),
+                  o.src_const.c_str(),
                   int_or(o.pace),
                   flt_or(o.ema),
                   int_or(o.expand),
@@ -478,8 +478,8 @@ WsDdpControl::StreamCfg WsDdpControl::compute_stream_cfg_(uint8_t out) const {
   auto oit = outputs_.find(out);
   const OutCfg *o = (oit != outputs_.end()) ? &oit->second : nullptr;
 
-  // strings first (escaped); leave std::nullopt if unspecified
-  if (o && o->src_const) e.src = json_escape_(*o->src_const);
+  // strings first (escaped); src is now required
+  if (o) e.src = json_escape_(o->src_const);
   if (o && o->hw_const)  e.hw  = json_escape_(*o->hw_const);
 
   // numeric/toggles — propagate only if set in YAML
