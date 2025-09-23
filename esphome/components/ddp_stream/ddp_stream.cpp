@@ -265,7 +265,8 @@ void DdpStream::loop() {
 void DdpStream::ensure_socket_() {
   bool net_up = network::is_connected();
   if (net_up) {
-    if (sock_ < 0) open_socket_();
+    // Don't reopen while a previous task is still winding down.
+    if (sock_ < 0 && !task_stopping_.load()) open_socket_();
   } else {
     if (sock_ >= 0) close_socket_();
   }
@@ -303,21 +304,22 @@ void DdpStream::open_socket_() {
 
   if (task_ == nullptr) {
     task_should_exit_.store(false);
+    task_stopping_.store(false);
     // Higher prio + pin to opposite core from typical LVGL usage
     xTaskCreatePinnedToCore(&DdpStream::recv_task_trampoline, "ddp_rx",
-                            6144, this, 6, &task_, 1);
+                            8192, this, 6, &task_, 1);
   }
 }
 
 void DdpStream::close_socket_() {
   if (task_ != nullptr) {
+    task_stopping_.store(true);
     // Signal task to exit and close socket to break out of select()
     task_should_exit_.store(true);
     if (sock_ >= 0) { ::shutdown(sock_, SHUT_RDWR); ::close(sock_); sock_ = -1; }
 
     // Wait for task to exit gracefully with timeout
     TaskHandle_t t = task_;
-    task_ = nullptr;
 
     // Give the task some time to exit cleanly
     for (int i = 0; i < 100; i++) {
@@ -329,6 +331,8 @@ void DdpStream::close_socket_() {
     if (eTaskGetState(t) != eDeleted) {
       vTaskDelete(t);
     }
+    task_ = nullptr;
+    task_stopping_.store(false);
   } else if (sock_ >= 0) {
     ::shutdown(sock_, SHUT_RDWR); ::close(sock_); sock_ = -1;
   }
@@ -421,6 +425,8 @@ void DdpStream::recv_task() {
       vTaskDelay(pdMS_TO_TICKS(1));
     }
   }
+  ESP_LOGI(TAG, "ddp_rx task exiting");
+  vTaskDelete(nullptr);
 }
 
 // -------- binding helpers --------

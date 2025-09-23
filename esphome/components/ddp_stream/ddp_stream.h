@@ -169,6 +169,7 @@ class DdpStream : public Component {
   int sock_{-1};
   TaskHandle_t task_{nullptr};
   std::atomic<bool> task_should_exit_{false};
+  std::atomic<bool> task_stopping_{false};
   uint8_t default_back_buffers_{2};
   uint8_t  preferred_fmt_{0};  // 0=RGB888 (default), 1=RGB565
 
