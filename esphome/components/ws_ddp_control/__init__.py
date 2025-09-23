@@ -10,30 +10,29 @@ DEPENDENCIES = ["network", "lvgl", "ddp_stream"]
 
 ws_ns = cg.esphome_ns.namespace("ws_ddp_control")
 WsDdpControl = ws_ns.class_("WsDdpControl", cg.Component)
+WsDdpOutput = ws_ns.class_("WsDdpOutput", cg.Component)
 
 ddp_ns = cg.esphome_ns.namespace("ddp_stream")
 DdpStream = ddp_ns.class_("DdpStream", cg.Component)
+DdpStreamOutput = ddp_ns.class_("DdpStreamOutput", cg.Component)
 
 CONF_WS_HOST   = "ws_host"
 CONF_WS_PORT   = "ws_port"
 CONF_DEVICE_ID = "device_id"
 CONF_DDP       = "ddp"
 CONF_OUTPUTS   = "outputs"
-CONF_OUTPUT_ID = "output_id"
+CONF_DDP_STREAM = "ddp_stream"
 CONF_SRC       = "src"
 
 OUTPUT_SCHEMA = cv.Schema({
-    cv.Required("id"): cv.int_range(min=0, max=255),
-    # Width/height optional; if omitted we auto-detect from the canvas via ddp_stream
+    cv.GenerateID(): cv.declare_id(WsDdpOutput),
+    cv.Required(CONF_DDP_STREAM): cv.use_id(DdpStreamOutput),
     cv.Optional("width"): cv.int_range(min=1, max=4096),
     cv.Optional("height"): cv.int_range(min=1, max=4096),
 
-    # Orchestration defaults (all can be changed at runtime via setters)
     cv.Required("src"): cv.string,
     cv.Optional("pace"): cv.int_range(min=0, max=240),
     cv.Optional("ema"): cv.float_range(min=0.0, max=1.0),
-    # expand: 0=never, 1=auto, 2=force
-    # Accept ints and aliases, plus numeric strings ("0","1","2")
     cv.Optional("expand"): cv.Any(
         cv.int_range(min=0, max=2),
         cv.one_of("never", "auto", "force", "0", "1", "2", lower=True),
@@ -42,7 +41,6 @@ OUTPUT_SCHEMA = cv.Schema({
     cv.Optional("hw"): cv.one_of(
         "auto", "none", "cuda", "qsv", "vaapi", "videotoolbox", "d3d11va", lower=True
     ),
-    # Per-output transport format. 'rgb565' will auto-pick endian from the sink.
     cv.Optional("format"): cv.one_of(
         "rgb888", "rgb565", "rgb565le", "rgb565be", lower=True
     ),
@@ -68,19 +66,16 @@ SetSrcAction = ws_ns.class_("SetSrcAction", automation.Action)
     "ws_ddp_control.set_src",
     SetSrcAction,
     cv.Schema({
-        cv.GenerateID(): cv.use_id(WsDdpControl),
-        cv.Required(CONF_OUTPUT_ID): cv.int_range(min=0, max=255),
+        cv.GenerateID(CONF_ID): cv.use_id(WsDdpOutput),
         cv.Required(CONF_SRC): cv.templatable(cv.string),
     })
 )
 async def set_src_action_to_code(config, action_id, template_arg, args):
-    paren = await cg.get_variable(config[CONF_ID])
-    output_id = config[CONF_OUTPUT_ID]
-
-    # Create a specialized action class with the output_id baked in
-    var = cg.new_Pvariable(action_id, template_arg, paren, output_id)
+    output = await cg.get_variable(config[CONF_ID])
+    var = cg.new_Pvariable(action_id, template_arg, output)
     src_templ = await cg.templatable(config[CONF_SRC], args, cg.std_string)
     cg.add(var.set_src(src_templ))
+
     return var
 
 def _templ(expr):
@@ -101,10 +96,20 @@ async def to_code(config):
     ddp = await cg.get_variable(config[CONF_DDP])
     cg.add(var.set_ddp(ddp))
 
-    # Outputs with optional explicit w/h (pass -1 to auto-detect)
+    # Create WsDdpOutput components
     for s in config[CONF_OUTPUTS]:
+        ddp_stream_component = await cg.get_variable(s[CONF_DDP_STREAM])
+        output = cg.new_Pvariable(s[CONF_ID])
+        await cg.register_component(output, s)
+        cg.add(output.set_ddp_stream_id(ddp_stream_component.get_ddp_stream_id()))
+        cg.add(output.set_parent(var))
+        cg.add(var.register_output(
+            output,
+            ddp_stream_component.get_ddp_stream_id(),
+            s.get("width", -1),
+            s.get("height", -1)
+        ))
         exp = s.get("expand", "auto")
-        # normalize expand → 0/1/2
         if isinstance(exp, (int, float)):
             exp_i = max(0, min(2, int(exp)))
         else:
@@ -114,19 +119,12 @@ async def to_code(config):
             elif e in ("force", "2"): exp_i = 2
             else:                     exp_i = 1
 
-        cg.add(var.add_output_basic(
-            s["id"],
-            s.get("width", -1),
-            s.get("height", -1)
-        ))
+        if "src" in s: cg.add(output.set_src(s["src"]))
+        if "pace" in s: cg.add(output.set_pace(s["pace"]))
+        if "ema" in s: cg.add(output.set_ema(s["ema"]))
+        if exp_i is not None: cg.add(output.set_expand(exp_i))
+        if "loop" in s: cg.add(output.set_loop(s["loop"]))
+        if "hw" in s: cg.add(output.set_hw(s["hw"]))
+        if "format" in s: cg.add(output.set_format(s["format"]))
 
-        if "src" in s: cg.add(var.set_src(s["id"], s["src"]))
-        if "pace" in s: cg.add(var.set_pace(s["id"], s["pace"]))
-        if "ema" in s: cg.add(var.set_ema(s["id"], s["ema"]))
-        if exp_i is not None: cg.add(var.set_expand(s["id"], exp_i))
-        if "loop" in s: cg.add(var.set_loop(s["id"], s["loop"]))
-        if "hw" in s: cg.add(var.set_hw(s["id"], s["hw"]))
-        if "format" in s: cg.add(var.set_format(s["id"], s["format"]))
-
-    # Ensure esp_websocket_client is linked
     add_idf_component(name="espressif/esp_websocket_client", ref="1.5.0")

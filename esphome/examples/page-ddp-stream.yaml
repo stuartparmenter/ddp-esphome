@@ -24,10 +24,12 @@ ddp_stream:
   id: ddp
   port: ${DDP_PORT}
   streams:
-    - id: ${OUT_ID}
-      canvas_id: "canvas64"
-    # - id: 2
-    #   canvas_id: "canvas32"
+    - id: stream_${OUT_ID}
+      canvas: "canvas64"
+      # stream: auto-generated (starts at 2)
+    # - id: stream_2
+    #   canvas: "canvas32"
+    #   # stream: auto-generated
 
 # -----------------------------
 # WebSocket control
@@ -39,7 +41,8 @@ ws_ddp_control:
   device_id: "esp32-ddp"        # Optional device identifier
   ddp: ddp
   outputs:
-    - id: 1
+    - id: output_${OUT_ID}
+      ddp_stream: stream_${OUT_ID}  # References the ddp_stream's stream ID
       src: ${DEFAULT_VIDEO_SRC}
       # width/height optional; if omitted, auto from canvas
       # width: 64
@@ -50,7 +53,8 @@ ws_ddp_control:
       # expand: auto
       # loop: true
       # hw: auto
-    # - id: 2
+    # - id: output_2
+    #   ddp_stream: stream_2
     #   src: ${VIDEO_SRC_2}
 
 # -----------------------------
@@ -68,11 +72,11 @@ lvgl:
         then:
           - lambda: |-
               id(ws).connect();
-              id(ws).start(${OUT_ID});
+              id(output_${OUT_ID}).start();
       on_unload:
         then:
           - lambda: |-
-              id(ws).stop(${OUT_ID});
+              id(output_${OUT_ID}).stop();
               id(ws).disconnect();
 
 # -----------------------------
@@ -88,7 +92,6 @@ text:
     on_value:
       then:
         - ws_ddp_control.set_src:
-            id: ws
-            output_id: ${OUT_ID}
+            id: output_${OUT_ID}  # Reference the output ID directly
             src: !lambda "return x;"
 

@@ -44,10 +44,11 @@ ddp_stream:
   id: ddp
   port: 4048
   streams:
-    - id: 1
-      canvas_id: canvas64
-      width: 64
-      height: 64
+    - id: stream_1              # Required: ESPHome component ID for this stream
+      canvas: canvas64          # Required: LVGL canvas object name
+      width: 64                 # Optional: Override canvas width
+      height: 64                # Optional: Override canvas height
+      # stream: auto            # Optional: DDP stream number (auto-generated if omitted)
 ```
 
 ### `ws_ddp_control`
@@ -61,7 +62,8 @@ ws_ddp_control:
   device_id: "esp32-device"     # Optional: Device identifier (default: "unknown")
   url: ""                       # Optional: Full WebSocket URL override
   outputs:                      # Optional: List of output streams
-    - id: 1                     # Required: Stream ID (0-255)
+    - id: output_1              # Required: ESPHome component ID for this output
+      ddp_stream: stream_1      # Required: Reference to ddp_stream's stream component
       src: ${VIDEO_SRC}         # Required: Video source
       width: 64                 # Optional: Output width (auto-detected if omitted)
       height: 64                # Optional: Output height (auto-detected if omitted)
@@ -71,6 +73,15 @@ ws_ddp_control:
       expand: auto              # Optional: Scaling (never, auto, force)
       loop: true                # Optional: Loop video playbook
       hw: auto                  # Optional: Hardware acceleration (auto, none, cuda, qsv, vaapi, videotoolbox, d3d11va)
+```
+
+### Using Actions
+
+```yaml
+# Runtime source change example
+- ws_ddp_control.set_src:
+    id: output_1                # Reference the WsDdpOutput component directly
+    src: "new_video.mp4"
 ```
 
 ---

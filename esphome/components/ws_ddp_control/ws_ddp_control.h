@@ -18,6 +18,45 @@ extern "C" {
 
 namespace esphome { namespace ws_ddp_control {
 
+// Forward declarations
+class WsDdpControl;
+
+class WsDdpOutput : public Component {
+ public:
+  void set_ddp_stream_id(uint8_t ddp_stream_id) { ddp_stream_id_ = ddp_stream_id; }
+  void set_parent(WsDdpControl* parent) { parent_ = parent; }
+
+  // Per-output control API
+  void start();
+  void stop();
+  void set_src(const std::string &src);
+  void set_pace(int pace);
+  void set_ema(float ema);
+  void set_expand(int expand);
+  void set_loop(bool loop);
+  void set_hw(const std::string &hw);
+  void set_format(const std::string &fmt);
+
+  // ESPHome lifecycle
+  void setup() override {}
+  void dump_config() override;
+
+ protected:
+  uint8_t ddp_stream_id_{0};
+  WsDdpControl* parent_{nullptr};
+
+  // Output configuration
+  std::string src_const_;
+  std::optional<int> pace_;
+  std::optional<float> ema_;
+  std::optional<int> expand_;
+  std::optional<bool> loop_;
+  std::optional<std::string> hw_const_;
+  std::optional<std::string> format_const_;
+
+  friend class WsDdpControl;
+};
+
 class WsDdpControl : public Component {
  public:
   // ------------- config (templatable) -------------
@@ -42,19 +81,11 @@ class WsDdpControl : public Component {
   void send_text(const std::string &json_utf8) { this->send_text(json_utf8.c_str()); }
 
 
-  // ------------- control API -------------
-  void add_output_basic(uint8_t id, int w, int h);
-
-  void start(uint8_t out);
-  void stop(uint8_t out);
-
-  void set_src(uint8_t out, const std::string &s);
-  void set_pace(uint8_t out, int pace);
-  void set_ema(uint8_t out, float ema);
-  void set_expand(uint8_t out, int expand);
-  void set_loop(uint8_t out, bool loop);
-  void set_hw(uint8_t out, const std::string &hw);
-  void set_format(uint8_t out, const std::string &fmt);
+  // ------------- shared websocket control API -------------
+  void register_output(WsDdpOutput* output, uint8_t ddp_stream_id, int w, int h);
+  void start_stream(WsDdpOutput* output);
+  void stop_stream(WsDdpOutput* output);
+  void send_update(WsDdpOutput* output);
 
   // ESPHome
   void setup() override {}
@@ -84,6 +115,7 @@ class WsDdpControl : public Component {
 
   // resolve width/height: explicit override or auto from ddp canvas
   void resolve_size_(uint8_t out, int *w, int *h) const;
+
 
   // A fully resolved, ready-to-transmit stream config (YAML + runtime overrides + ddp info)
   struct StreamCfg {
@@ -122,34 +154,29 @@ class WsDdpControl : public Component {
   uint32_t reconnect_backoff_ms_{1000}; // Current backoff delay
 
   // outputs
-  struct OutCfg {
+  struct OutputInfo {
+    WsDdpOutput* output{nullptr};
     int w{-1}, h{-1};                 // -1 means "auto from canvas"
-    std::string src_const;
-    std::optional<int>         pace;
-    std::optional<float>       ema;
-    std::optional<int>         expand;        // 0/1/2
-    std::optional<bool>        loop;
-    std::optional<std::string> hw_const;      // "auto","none","cuda","qsv","vaapi","videotoolbox","d3d11va"
-    std::optional<std::string> format_const;  // "rgb888","rgb565","rgb565le","rgb565be"
+    bool active{false};
   };
-  std::map<uint8_t, OutCfg> outputs_;
-  std::map<uint8_t, bool>   active_;
+  std::map<uint8_t, OutputInfo> outputs_;
 };
 
 template<typename... Ts> class SetSrcAction : public Action<Ts...> {
  public:
-  SetSrcAction(WsDdpControl *parent, uint8_t output_id) : parent_(parent), output_id_(output_id) {}
+  SetSrcAction(WsDdpOutput* output) : output_(output) {}
 
   TEMPLATABLE_VALUE(std::string, src)
 
   void play(Ts... x) override {
     std::string src = this->src_.value(x...);
-    this->parent_->set_src(output_id_, src);
+    if (output_) {
+      output_->set_src(src);
+    }
   }
 
  protected:
-  WsDdpControl *parent_;
-  const uint8_t output_id_;
+  WsDdpOutput* output_;
 };
 
 }}  // namespace esphome::ws_ddp_control

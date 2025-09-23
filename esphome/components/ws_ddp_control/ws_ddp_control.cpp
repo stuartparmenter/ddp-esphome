@@ -20,6 +20,73 @@ static const char *TAG = "ws_ddp_control";
 namespace esphome {
 namespace ws_ddp_control {
 
+// ----------------- WsDdpOutput implementation -----------------
+
+void WsDdpOutput::start() {
+  if (parent_) {
+    parent_->start_stream(this);
+  }
+}
+
+void WsDdpOutput::stop() {
+  if (parent_) {
+    parent_->stop_stream(this);
+  }
+}
+
+void WsDdpOutput::set_src(const std::string &src) {
+  src_const_ = src;
+  if (parent_) {
+    parent_->send_update(this);
+  }
+}
+
+void WsDdpOutput::set_pace(int pace) {
+  pace_ = pace;
+  if (parent_) {
+    parent_->send_update(this);
+  }
+}
+
+void WsDdpOutput::set_ema(float ema) {
+  ema_ = ema;
+  if (parent_) {
+    parent_->send_update(this);
+  }
+}
+
+void WsDdpOutput::set_expand(int expand) {
+  expand_ = expand;
+  if (parent_) {
+    parent_->send_update(this);
+  }
+}
+
+void WsDdpOutput::set_loop(bool loop) {
+  loop_ = loop;
+  if (parent_) {
+    parent_->send_update(this);
+  }
+}
+
+void WsDdpOutput::set_hw(const std::string &hw) {
+  hw_const_ = hw;
+  if (parent_) {
+    parent_->send_update(this);
+  }
+}
+
+void WsDdpOutput::set_format(const std::string &fmt) {
+  format_const_ = fmt;
+  if (parent_) {
+    parent_->send_update(this);
+  }
+}
+
+void WsDdpOutput::dump_config() {
+  ESP_LOGCONFIG(TAG, "WsDdpOutput: stream_id=%u", ddp_stream_id_);
+}
+
 // ----------------- local helpers (no header changes required) -----------------
 static inline void append_json_str(std::string &dst, const char *key, const std::string &val) {
   dst += "\""; dst += key; dst += "\":\""; dst += val; dst += "\"";
@@ -145,7 +212,7 @@ void WsDdpControl::ws_event_trampoline(void *arg,
         self->reset_backoff_();  // Reset reconnection backoff on successful connect
         self->send_hello_();
         // replay all active streams on main thread
-        for (auto &kv : self->active_) if (kv.second) self->start_(kv.first);
+        for (auto &kv : self->outputs_) if (kv.second.active) self->start_(kv.first);
       });
       break;
 
@@ -202,23 +269,26 @@ void WsDdpControl::dump_config() {
   // Print each output with explicit/auto sizing and which optionals are set
   for (const auto &kv : outputs_) {
     uint8_t id = kv.first;
-    const OutCfg &o = kv.second;
+    const OutputInfo &info = kv.second;
+    const WsDdpOutput* output = info.output;
     ESP_LOGCONFIG(TAG, "  - out=%u size=%dx%d (%s)",
-                  (unsigned) id, o.w, o.h,
-                  (o.w > 0 && o.h > 0) ? "explicit" : "auto");
+                  (unsigned) id, info.w, info.h,
+                  (info.w > 0 && info.h > 0) ? "explicit" : "auto");
     auto str_or = [](const std::optional<std::string> &v){ return v ? v->c_str() : "(unset)"; };
     auto int_or = [](const std::optional<int> &v){ return v ? std::to_string(*v).c_str() : "(unset)"; };
     auto flt_or = [](const std::optional<float> &v){ return v ? std::to_string(*v).c_str() : "(unset)"; };
     auto boo_or = [](const std::optional<bool> &v){ return v ? (*v ? "true" : "false") : "(unset)"; };
 
-    ESP_LOGCONFIG(TAG, "      src=%s pace=%s ema=%s expand=%s loop=%s hw=%s format=%s",
-                  o.src_const.c_str(),
-                  int_or(o.pace),
-                  flt_or(o.ema),
-                  int_or(o.expand),
-                  boo_or(o.loop),
-                  str_or(o.hw_const),
-                  str_or(o.format_const));
+    if (output) {
+      ESP_LOGCONFIG(TAG, "      src=%s pace=%s ema=%s expand=%s loop=%s hw=%s format=%s",
+                    output->src_const_.c_str(),
+                    int_or(output->pace_),
+                    flt_or(output->ema_),
+                    int_or(output->expand_),
+                    boo_or(output->loop_),
+                    str_or(output->hw_const_),
+                    str_or(output->format_const_));
+    }
   }
 }
 
@@ -381,51 +451,50 @@ void WsDdpControl::send_text(const char *json_utf8) {
 }
 
 // ------------- orchestration API -------------
-void WsDdpControl::add_output_basic(uint8_t id, int w, int h) {
-  OutCfg cfg; cfg.w = w; cfg.h = h; outputs_[id] = std::move(cfg);
+void WsDdpControl::register_output(WsDdpOutput* output, uint8_t ddp_stream_id, int w, int h) {
+  OutputInfo info;
+  info.output = output;
+  info.w = w;
+  info.h = h;
+  info.active = false;
+  outputs_[ddp_stream_id] = info;
 }
 
-void WsDdpControl::start(uint8_t out) {
-  active_[out] = true;
-  if (!this->is_connected()) {
-    ESP_LOGD(TAG, "start: deferring out=%u until WS connects", (unsigned) out);
-    if (!pending_connect_) this->connect();
-    return;
+void WsDdpControl::start_stream(WsDdpOutput* output) {
+  if (!output) return;
+  uint8_t ddp_stream_id = output->ddp_stream_id_;
+
+  auto it = outputs_.find(ddp_stream_id);
+  if (it != outputs_.end()) {
+    it->second.active = true;
+    if (!this->is_connected()) {
+      ESP_LOGD(TAG, "start: deferring stream=%u until WS connects", (unsigned) ddp_stream_id);
+      if (!pending_connect_) this->connect();
+      return;
+    }
+    this->start_(ddp_stream_id);
   }
-  this->start_(out);
-}
-void WsDdpControl::stop(uint8_t out) {
-  active_[out] = false;
-  this->stop_(out);
 }
 
-void WsDdpControl::set_src(uint8_t out, const std::string &s) {
-  outputs_[out].src_const = s;
-  if (active_[out] && this->is_connected()) this->send_update_(out);
+void WsDdpControl::stop_stream(WsDdpOutput* output) {
+  if (!output) return;
+  uint8_t ddp_stream_id = output->ddp_stream_id_;
+
+  auto it = outputs_.find(ddp_stream_id);
+  if (it != outputs_.end()) {
+    it->second.active = false;
+    this->stop_(ddp_stream_id);
+  }
 }
-void WsDdpControl::set_pace(uint8_t out, int pace) {
-  outputs_[out].pace = pace;
-  if (active_[out] && this->is_connected()) this->send_update_(out);
-}
-void WsDdpControl::set_ema(uint8_t out, float ema) {
-  outputs_[out].ema = ema;
-  if (active_[out] && this->is_connected()) this->send_update_(out);
-}
-void WsDdpControl::set_expand(uint8_t out, int expand) {
-  outputs_[out].expand = expand;
-  if (active_[out] && this->is_connected()) this->send_update_(out);
-}
-void WsDdpControl::set_loop(uint8_t out, bool loop) {
-  outputs_[out].loop = loop;
-  if (active_[out] && this->is_connected()) this->send_update_(out);
-}
-void WsDdpControl::set_hw(uint8_t out, const std::string &hw) {
-  outputs_[out].hw_const = hw;
-  if (active_[out] && this->is_connected()) this->send_update_(out);
-}
-void WsDdpControl::set_format(uint8_t out, const std::string &fmt) {
-  outputs_[out].format_const = fmt;
-  if (active_[out] && this->is_connected()) this->send_update_(out);
+
+void WsDdpControl::send_update(WsDdpOutput* output) {
+  if (!output) return;
+  uint8_t ddp_stream_id = output->ddp_stream_id_;
+
+  auto it = outputs_.find(ddp_stream_id);
+  if (it != outputs_.end() && it->second.active && this->is_connected()) {
+    this->send_update_(ddp_stream_id);
+  }
 }
 
 // --------- size/fmt/escape helpers ----------
@@ -466,6 +535,7 @@ void WsDdpControl::resolve_size_(uint8_t out, int *w, int *h) const {
   if (h) *h = (H > 0 ? H : 0);
 }
 
+
 // Produce a fully-resolved config for a given output (YAML + overrides + ddp)
 WsDdpControl::StreamCfg WsDdpControl::compute_stream_cfg_(uint8_t out) const {
   StreamCfg e{};
@@ -476,23 +546,23 @@ WsDdpControl::StreamCfg WsDdpControl::compute_stream_cfg_(uint8_t out) const {
 
   // look up base cfg (may be absent if caller validates separately)
   auto oit = outputs_.find(out);
-  const OutCfg *o = (oit != outputs_.end()) ? &oit->second : nullptr;
+  const WsDdpOutput* output = (oit != outputs_.end()) ? oit->second.output : nullptr;
 
   // strings first (escaped); src is now required
-  if (o) e.src = json_escape_(o->src_const);
-  if (o && o->hw_const)  e.hw  = json_escape_(*o->hw_const);
+  if (output) e.src = json_escape_(output->src_const_);
+  if (output && output->hw_const_) e.hw = json_escape_(*output->hw_const_);
 
   // numeric/toggles — propagate only if set in YAML
-  if (o && o->pace)   e.pace   = *o->pace;
-  if (o && o->ema)    e.ema    = *o->ema;
-  if (o && o->expand) e.expand = *o->expand;
-  if (o && o->loop)   e.loop   = *o->loop;
+  if (output && output->pace_) e.pace = *output->pace_;
+  if (output && output->ema_) e.ema = *output->ema_;
+  if (output && output->expand_) e.expand = *output->expand_;
+  if (output && output->loop_) e.loop = *output->loop_;
 
   // format → (fmt,pixcfg)
-  if (o && o->format_const) {
-    auto rp   = resolve_fmt_and_pixcfg_(*o->format_const, ddp_);
-    e.fmt     = rp.first;
-    e.pixcfg  = rp.second;
+  if (output && output->format_const_) {
+    auto rp = resolve_fmt_and_pixcfg_(*output->format_const_, ddp_);
+    e.fmt = rp.first;
+    e.pixcfg = rp.second;
   }
 
   return e;
@@ -522,7 +592,8 @@ void WsDdpControl::start_(uint8_t out) {
              (unsigned) out, e.w, e.h);
     this->set_timeout(200, [this, out]() {
       // only retry if still active and connected
-      if (this->active_[out] && this->is_connected()) this->start_(out);
+      auto it = this->outputs_.find(out);
+      if (it != this->outputs_.end() && it->second.active && this->is_connected()) this->start_(out);
     });
     return;
   }
