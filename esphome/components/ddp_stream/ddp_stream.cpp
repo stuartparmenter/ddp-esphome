@@ -264,18 +264,21 @@ void DdpStream::loop() {
         ? ((double)stream.rx_pkts_in_slices_ / (double)stream.rx_wakeups_)
         : 0.0;
 
-      ESP_LOGI(TAG,
-        "id=%u rx_pkts=%llu rx_B=%llu win{push=%.1ffps pres=%.1ffps rx=%.2fMb/s wire=%.2fMb/s pkt_gap=%u overrun=%u} "
-        "tot{push=%u pres=%u overrun=%u} cov(avg)=%.1f%% build(avg)=%.1f ms lat(avg)=%.1f ms qwait(avg)=%.1f ms intra(max)=%.1f ms "
-        "rx_slc{wakeups=%u pkts/burst=%.2f}",
-        (unsigned)id,
-        (unsigned long long)stream.rx_pkts_,
-        (unsigned long long)stream.rx_bytes_,
-        push_fps, pres_fps, rx_mbps, rx_wire_mbps, stream.win_pkt_gap_, stream.win_overrun_,
-        stream.frames_push_, stream.frames_presented_, stream.frames_overrun_,
-        cov_pct, stream.build_ms_ewma_, lat_ms, qwait_ms, stream.intra_ms_max_,
-        stream.rx_wakeups_, pkts_per_wakeup
-      );
+      // Only log if there was activity in this window
+      if (stream.win_frames_push_ > 0 || stream.win_frames_presented_ > 0 || stream.win_rx_bytes_ > 0) {
+        ESP_LOGI(TAG,
+          "id=%u rx_pkts=%llu rx_B=%llu win{push=%.1ffps pres=%.1ffps rx=%.2fMb/s wire=%.2fMb/s pkt_gap=%u overrun=%u} "
+          "tot{push=%u pres=%u overrun=%u} cov(avg)=%.1f%% build(avg)=%.1f ms lat(avg)=%.1f ms qwait(avg)=%.1f ms intra(max)=%.1f ms "
+          "rx_slc{wakeups=%u pkts/burst=%.2f}",
+          (unsigned)id,
+          (unsigned long long)stream.rx_pkts_,
+          (unsigned long long)stream.rx_bytes_,
+          push_fps, pres_fps, rx_mbps, rx_wire_mbps, stream.win_pkt_gap_, stream.win_overrun_,
+          stream.frames_push_, stream.frames_presented_, stream.frames_overrun_,
+          cov_pct, stream.build_ms_ewma_, lat_ms, qwait_ms, stream.intra_ms_max_,
+          stream.rx_wakeups_, pkts_per_wakeup
+        );
+      }
 
       // reset window; keep totals & EWMA
       stream.rx_wakeups_ = 0;
