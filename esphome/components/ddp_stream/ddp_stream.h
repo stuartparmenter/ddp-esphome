@@ -50,6 +50,7 @@ class DdpStreamOutput : public Component {
   // ESPHome lifecycle
   void setup() override;
   void dump_config() override;
+  float get_setup_priority() const override { return setup_priority::LATE; }
 
  protected:
   uint8_t ddp_stream_id_{0};
@@ -173,7 +174,7 @@ class DdpStream : public Component {
   void setup() override;
   void dump_config() override;
   void loop() override;
-  float get_setup_priority() const override { return setup_priority::LATE; }
+  float get_setup_priority() const override { return setup_priority::AFTER_CONNECTION; }
 
  private:
 
@@ -207,6 +208,11 @@ class DdpStream : public Component {
 
   bool udp_opened_{false};
   std::map<uint8_t, DdpStreamOutput*> streams_;
+
+  // Loop optimization: disable when idle
+  std::atomic<bool> loop_is_disabled_{false};
+  int64_t last_activity_us_{0};
+  static constexpr int64_t IDLE_TIMEOUT_US = 1'000'000;  // 1 second
 };
 
 }  // namespace ddp_stream

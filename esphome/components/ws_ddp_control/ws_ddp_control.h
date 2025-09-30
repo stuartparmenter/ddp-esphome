@@ -40,6 +40,7 @@ class WsDdpOutput : public Component {
   // ESPHome lifecycle
   void setup() override {}
   void dump_config() override;
+  float get_setup_priority() const override { return setup_priority::LATE; }
 
  protected:
   uint8_t ddp_stream_id_{0};
@@ -90,7 +91,7 @@ class WsDdpControl : public Component {
   // ESPHome
   void setup() override {}
   void dump_config() override;
-  void loop() override {}
+  float get_setup_priority() const override { return setup_priority::AFTER_CONNECTION; }
 
  protected:
   // ws event trampoline

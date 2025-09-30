@@ -185,6 +185,8 @@ void DdpStream::dump_config() {
 }
 
 void DdpStream::loop() {
+  bool had_activity = false;
+
   for (auto &kv : streams_) {
     DdpStreamOutput &stream = *kv.second;
 
@@ -212,6 +214,7 @@ void DdpStream::loop() {
       if (stream.canvas_) {
         lv_obj_invalidate(stream.canvas_);
         did_present = true;
+        had_activity = true;
       }
     }
 
@@ -294,6 +297,19 @@ void DdpStream::loop() {
     }
   }
 #endif
+
+  // Loop optimization: disable when idle for 1 second
+  if (had_activity) {
+    last_activity_us_ = esp_timer_get_time();
+    loop_is_disabled_.store(false, std::memory_order_relaxed);
+  } else if (last_activity_us_ != 0) {
+    int64_t idle_us = esp_timer_get_time() - last_activity_us_;
+    if (idle_us > IDLE_TIMEOUT_US) {
+      this->disable_loop();
+      loop_is_disabled_.store(true, std::memory_order_release);
+      last_activity_us_ = 0;
+    }
+  }
 }
 
 // -------- socket/RX --------
@@ -680,6 +696,11 @@ void DdpStream::handle_packet_(const uint8_t *raw, size_t n) {
     } else { // back_buffers == 0
       stream->need_invalidate_.store(true, std::memory_order_relaxed);
     }
+
+    // Wake loop if it was disabled due to inactivity
+    if (loop_is_disabled_.load(std::memory_order_acquire)) {
+      this->enable_loop_soon_any_context();
+    }
 #if DDP_STREAM_METRICS
   stream->ready_set_us_ = esp_timer_get_time();
   // Remember when the frame actually started, to compute present latency later.
@@ -690,6 +711,11 @@ void DdpStream::handle_packet_(const uint8_t *raw, size_t n) {
 
 // Present path used by PUSH-only packets
 void DdpStream::handle_push_(DdpStreamOutput &stream, const DdpHeader* h) {
+  // Wake loop if it was disabled due to inactivity
+  if (loop_is_disabled_.load(std::memory_order_acquire)) {
+    this->enable_loop_soon_any_context();
+  }
+
 #if DDP_STREAM_METRICS
   stream.frames_push_ += 1;
   stream.win_frames_push_ += 1;
