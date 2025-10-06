@@ -18,7 +18,7 @@ CONF_STREAM = "stream"
 STREAM_SCHEMA = cv.Schema({
     cv.GenerateID(): cv.declare_id(DdpStreamOutput),
     cv.Required(CONF_CANVAS): cv.string,
-    cv.Optional(CONF_STREAM): cv.int_range(min=2, max=249),
+    cv.Optional(CONF_STREAM): cv.int_range(min=1, max=249),
     cv.Optional("width", default=-1): cv.int_,
     cv.Optional("height", default=-1): cv.int_,
     cv.Optional("back_buffers", default=None): cv.one_of(0, 1, 2, int=True),
