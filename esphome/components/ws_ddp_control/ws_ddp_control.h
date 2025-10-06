@@ -36,6 +36,7 @@ class WsDdpOutput : public Component {
   void set_loop(bool loop);
   void set_hw(const std::string &hw);
   void set_format(const std::string &fmt);
+  void set_fit(const std::string &fit);
 
   // ESPHome lifecycle
   void setup() override {}
@@ -54,6 +55,7 @@ class WsDdpOutput : public Component {
   std::optional<bool> loop_;
   std::optional<std::string> hw_const_;
   std::optional<std::string> format_const_;
+  std::optional<std::string> fit_const_;
 
   friend class WsDdpControl;
 };
@@ -130,6 +132,7 @@ class WsDdpControl : public Component {
     std::optional<float>       ema;
     std::optional<int>         expand;   // 0=never,1=auto,2=force
     std::optional<bool>        loop;
+    std::optional<std::string> fit;      // auto, pad, cover
   };
   StreamCfg compute_stream_cfg_(uint8_t out) const;
 

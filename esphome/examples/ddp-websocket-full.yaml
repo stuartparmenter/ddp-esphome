@@ -1,0 +1,126 @@
+# © Copyright 2025 Stuart Parmenter
+# SPDX-License-Identifier: MIT
+
+# Full DDP Stream Example with WebSocket Control
+#
+# This example demonstrates the complete setup with:
+# - DDP stream receiver (UDP on port 4048)
+# - WebSocket control client (connects to media-proxy server)
+# - LVGL canvas for rendering
+# - Runtime source control via Home Assistant text entity
+#
+# Prerequisites:
+#   - Running media-proxy server (https://github.com/stuartparmenter/media-proxy)
+#   - Network connectivity between ESP32 and media-proxy server
+#
+# Tested with ESPHome 2025.8 (ESP-IDF only)
+
+esphome:
+  name: ddp-stream-full
+  friendly_name: DDP Stream with WebSocket Control
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+# Enable logging
+logger:
+
+# WiFi configuration (customize for your network)
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+external_components:
+  - source: github://stuartparmenter/lvgl-ddp-stream@main  # Use @v0.4.2 or specific version for production
+    components: [ddp_stream, ws_ddp_control]
+
+# UDP DDP receiver - receives video frames
+ddp_stream:
+  id: ddp
+  port: 4048
+  streams:
+    - id: stream1
+      canvas: canvas_main
+      back_buffers: 1  # 0-2 buffers for smoother rendering
+
+# WebSocket control client - connects to media-proxy server
+ws_ddp_control:
+  id: ws
+  ws_host: "homeassistant.local"  # Replace with your media-proxy server hostname/IP
+  ws_port: 8788
+  device_id: "esp32-ddp"    # Optional device identifier
+  ddp: ddp
+  outputs:
+    - id: output1
+      ddp_stream: stream1
+      src: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
+      # Optional parameters:
+      # width: 320           # Auto-detected from canvas if omitted
+      # height: 240          # Auto-detected from canvas if omitted
+      # format: rgb888       # rgb888, rgb565, rgb565le, rgb565be
+      # pace: 0              # Frame pacing adjustment
+      # ema: 0.0             # Exponential moving average smoothing
+      # expand: auto         # Color range expansion (never, auto, force) - TV to PC range
+      # loop: true           # Loop video playback
+      # hw: auto             # Hardware acceleration
+      # fit: auto            # Aspect ratio handling (auto, pad, cover)
+
+# Display driver configuration
+# Replace this section with your actual display driver
+# Example shown for ST7789V
+display:
+  - platform: st7789v
+    id: my_display
+    model: Custom
+    width: 320
+    height: 240
+    offset_width: 0
+    offset_height: 0
+    # Add your specific display pins and configuration here
+    cs_pin: GPIO10
+    dc_pin: GPIO11
+    reset_pin: GPIO12
+
+# LVGL display setup
+lvgl:
+  displays:
+    - display_id: my_display
+
+  pages:
+    - id: page_video
+      widgets:
+        - canvas:
+            id: canvas_main
+            width: 320   # Adjust to match your display
+            height: 240  # Adjust to match your display
+
+      # Auto-connect and start playback when page loads
+      on_load:
+        then:
+          - lambda: |-
+              id(ws).connect();
+              id(output1).start();
+
+      # Stop playback and disconnect when page unloads
+      on_unload:
+        then:
+          - lambda: |-
+              id(output1).stop();
+              id(ws).disconnect();
+
+# Optional: Runtime source control via Home Assistant
+# Allows changing video source without recompiling
+text:
+  - platform: template
+    id: video_src_control
+    name: "DDP Video Source"
+    optimistic: true
+    initial_value: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
+    mode: text
+    on_value:
+      then:
+        - ws_ddp_control.set_src:
+            id: output1
+            src: !lambda "return x;"

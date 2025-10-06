@@ -44,6 +44,7 @@ OUTPUT_SCHEMA = cv.Schema({
     cv.Optional("format"): cv.one_of(
         "rgb888", "rgb565", "rgb565le", "rgb565be", lower=True
     ),
+    cv.Optional("fit"): cv.one_of("auto", "pad", "cover", lower=True),
 })
 
 CONFIG_SCHEMA = cv.Schema({
@@ -126,5 +127,6 @@ async def to_code(config):
         if "loop" in s: cg.add(output.set_loop(s["loop"]))
         if "hw" in s: cg.add(output.set_hw(s["hw"]))
         if "format" in s: cg.add(output.set_format(s["format"]))
+        if "fit" in s: cg.add(output.set_fit(s["fit"]))
 
     add_idf_component(name="espressif/esp_websocket_client", ref="1.5.0")

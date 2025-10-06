@@ -83,6 +83,13 @@ void WsDdpOutput::set_format(const std::string &fmt) {
   }
 }
 
+void WsDdpOutput::set_fit(const std::string &fit) {
+  fit_const_ = fit;
+  if (parent_) {
+    parent_->send_update(this);
+  }
+}
+
 void WsDdpOutput::dump_config() {
   ESP_LOGCONFIG(TAG, "WsDdpOutput: stream_id=%u", ddp_stream_id_);
 }
@@ -122,7 +129,8 @@ static std::string build_stream_json_(const char *type,
                                       const std::optional<float> &ema,
                                       const std::optional<int> &expand,
                                       const std::optional<bool> &loop,
-                                      const std::optional<std::string> &hw) {
+                                      const std::optional<std::string> &hw,
+                                      const std::optional<std::string> &fit) {
   std::string json;
   json.reserve(256);
   json += "{";
@@ -140,6 +148,7 @@ static std::string build_stream_json_(const char *type,
   if (expand) add([&](){ append_json_int(json, "expand", *expand); });
   if (loop)   add([&](){ append_json_bool(json, "loop", *loop); });
   if (hw)     add([&](){ append_json_str(json, "hw", *hw); });
+  if (fit)    add([&](){ append_json_str(json, "fit", *fit); });
   json += "}";
   return json;
 }
@@ -155,9 +164,10 @@ static void log_stream_line_(const char *label,
                              const std::optional<float> &ema,
                              const std::optional<int> &expand,
                              const std::optional<bool> &loop,
-                             const std::optional<std::string> &hw) {
+                             const std::optional<std::string> &hw,
+                             const std::optional<std::string> &fit) {
   ESP_LOGI(TAG, "tx %s out=%u size=%dx%d src=%s ddp_port=%u fmt=%s pixcfg=0x%02X "
-                "pace=%s ema=%s expand=%s loop=%s hw=%s",
+                "pace=%s ema=%s expand=%s loop=%s hw=%s fit=%s",
            label,
            (unsigned) out, w, h, src.c_str(), (unsigned) ddp_port,
            (fmt?fmt->c_str():"(unset)"), (unsigned) (pixcfg?*pixcfg:0),
@@ -165,7 +175,8 @@ static void log_stream_line_(const char *label,
            (ema?std::to_string(*ema).c_str():"(unset)"),
            (expand?std::to_string(*expand).c_str():"(unset)"),
            (loop?(*loop?"true":"false"):"(unset)"),
-           (hw?hw->c_str():"(unset)"));
+           (hw?hw->c_str():"(unset)"),
+           (fit?fit->c_str():"(unset)"));
 }
 
 // map format string -> ("fmt" field, pixcfg byte). For "rgb565" without endian,
@@ -565,6 +576,11 @@ WsDdpControl::StreamCfg WsDdpControl::compute_stream_cfg_(uint8_t out) const {
     e.pixcfg = rp.second;
   }
 
+  // fit
+  if (output && output->fit_const_) {
+    e.fit = json_escape_(*output->fit_const_);
+  }
+
   return e;
 }
 
@@ -577,9 +593,9 @@ void WsDdpControl::send_stream_(const char *type, uint8_t out) {
   StreamCfg e = this->compute_stream_cfg_(out);
   const std::string json = build_stream_json_(type, out, e.w, e.h, e.ddp_port,
                                               e.src, e.fmt, e.pixcfg,
-                                              e.pace, e.ema, e.expand, e.loop, e.hw);
+                                              e.pace, e.ema, e.expand, e.loop, e.hw, e.fit);
   log_stream_line_(type, out, e.w, e.h, e.ddp_port,
-                   e.src, e.fmt, e.pixcfg, e.pace, e.ema, e.expand, e.loop, e.hw);
+                   e.src, e.fmt, e.pixcfg, e.pace, e.ema, e.expand, e.loop, e.hw, e.fit);
   this->send_text(json);
 }
 
