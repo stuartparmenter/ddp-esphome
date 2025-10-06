@@ -1,0 +1,69 @@
+# © Copyright 2025 Stuart Parmenter
+# SPDX-License-Identifier: MIT
+
+# Standalone DDP Receiver Example
+#
+# This example demonstrates a minimal setup for receiving DDP streams
+# without requiring the media-proxy WebSocket control server.
+# Perfect for use with standalone DDP senders like LedFX.
+#
+# Usage:
+#   1. Configure your ESPHome device with network settings
+#   2. Send DDP packets to the device's IP address on port 4048
+#   3. Use stream ID 1 (default output device for LedFX compatibility)
+
+esphome:
+  name: ddp-receiver-only
+  friendly_name: DDP Receiver Only
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+# Enable logging
+logger:
+
+# WiFi configuration (customize for your network)
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+# UDP DDP receiver - listens on port 4048 (default)
+ddp_stream:
+  id: ddp
+  port: 4048
+  streams:
+    - id: stream1
+      canvas: canvas_main
+      back_buffers: 1  # 0-2 buffers for smoother rendering
+      stream: 1        # Stream ID 1 (default output device for LedFX)
+
+# LVGL display setup
+lvgl:
+  displays:
+    - display_id: my_display
+
+  pages:
+    - id: page_main
+      widgets:
+        - canvas:
+            id: canvas_main
+            width: 320   # Adjust to match your display
+            height: 240  # Adjust to match your display
+
+# Display driver configuration
+# Replace this section with your actual display driver
+# Example shown for ST7789V
+display:
+  - platform: st7789v
+    id: my_display
+    model: Custom
+    width: 320
+    height: 240
+    offset_width: 0
+    offset_height: 0
+    # Add your specific display pins and configuration here
+    cs_pin: GPIO10
+    dc_pin: GPIO11
+    reset_pin: GPIO12
