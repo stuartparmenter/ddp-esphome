@@ -147,7 +147,11 @@ struct DdpHeader {
 #pragma pack(pop)
 
 // Pixel config constants (DDP 'cfg' byte)
-static constexpr uint8_t DDP_PIXCFG_RGB888     = 0x2C;
+// Standard DDP data type for RGB (per DDP spec byte 2: bits C R TTT SSS)
+// TTT=001 (RGB), SSS=011 (8-bit) = 0x0B
+static constexpr uint8_t DDP_PIXCFG_RGB888     = 0x0B;
+// Legacy/simplified RGB type (some senders use TTT=001 only)
+static constexpr uint8_t DDP_PIXCFG_RGB_LEGACY = 0x01;
 // Custom extension values to indicate 16-bpp transport:
 static constexpr uint8_t DDP_PIXCFG_RGB565_BE  = 0x61;
 static constexpr uint8_t DDP_PIXCFG_RGB565_LE  = 0x62;

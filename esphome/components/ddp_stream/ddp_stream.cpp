@@ -624,7 +624,7 @@ void DdpStream::handle_packet_(const uint8_t *raw, size_t n) {
 #endif
 
   // Handle payload by format
-  if (cfg == DDP_PIXCFG_RGB888) {
+  if (cfg == DDP_PIXCFG_RGB888 || cfg == DDP_PIXCFG_RGB_LEGACY) {
     handle_rgb888_(*stream, h, p, len);
   } else if (cfg == DDP_PIXCFG_RGB565_LE || cfg == DDP_PIXCFG_RGB565_BE) {
     handle_rgb565_(*stream, h, p, len);
