@@ -152,7 +152,7 @@ struct DdpHeader {
 static constexpr uint8_t DDP_PIXCFG_RGB888     = 0x0B;
 // Legacy/simplified RGB type (some senders use TTT=001 only)
 static constexpr uint8_t DDP_PIXCFG_RGB_LEGACY = 0x01;
-// Custom extension values to indicate 16-bpp transport:
+// Custom extension values for RGB565 format (16 bits per pixel: 5R+6G+5B)
 static constexpr uint8_t DDP_PIXCFG_RGB565_BE  = 0x61;
 static constexpr uint8_t DDP_PIXCFG_RGB565_LE  = 0x62;
 
