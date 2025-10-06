@@ -48,14 +48,14 @@ class WsDdpOutput : public Component {
   WsDdpControl* parent_{nullptr};
 
   // Output configuration
-  std::string src_const_;
+  std::string src_;
   std::optional<int> pace_;
   std::optional<float> ema_;
   std::optional<int> expand_;
   std::optional<bool> loop_;
-  std::optional<std::string> hw_const_;
-  std::optional<std::string> format_const_;
-  std::optional<std::string> fit_const_;
+  std::optional<std::string> hw_;
+  std::optional<std::string> format_;
+  std::optional<std::string> fit_;
 
   friend class WsDdpControl;
 };
@@ -63,14 +63,14 @@ class WsDdpOutput : public Component {
 class WsDdpControl : public Component {
  public:
   // ------------- config (templatable) -------------
-  void set_ws_host(const std::string &h) { ws_host_const_ = h; }
+  void set_ws_host(const std::string &h) { ws_host_ = h; }
   void set_ws_host(std::function<std::string()> fn) { ws_host_fn_ = std::move(fn); }
   void set_ws_port(int v){ ws_port_ = v; }
 
-  void set_url(const std::string &url) { url_const_ = url; }
+  void set_url(const std::string &url) { url_ = url; }
   void set_url(std::function<std::string()> fn) { url_fn_ = std::move(fn); }
 
-  void set_device_id(const std::string &s){ dev_id_const_ = s; }
+  void set_device_id(const std::string &s){ dev_id_ = s; }
   void set_device_id(std::function<std::string()> fn){ dev_id_fn_ = std::move(fn); }
 
   // ------------- deps -------------
@@ -103,7 +103,7 @@ class WsDdpControl : public Component {
   void schedule_reconnect_();
   void reset_backoff_();
   std::string build_uri_() const;
-  std::string device_id_() const { return dev_id_fn_ ? dev_id_fn_() : dev_id_const_; }
+  std::string device_id_() const { return dev_id_fn_ ? dev_id_fn_() : dev_id_; }
   void send_hello_();
 
   // unified send for start/update
@@ -137,14 +137,14 @@ class WsDdpControl : public Component {
   StreamCfg compute_stream_cfg_(uint8_t out) const;
 
   // config (templatable)
-  std::string ws_host_const_;
+  std::string ws_host_;
   std::function<std::string()> ws_host_fn_;
   int ws_port_{8788};
 
-  std::string url_const_;
+  std::string url_;
   std::function<std::string()> url_fn_;
 
-  std::string dev_id_const_{"unknown"};
+  std::string dev_id_{"unknown"};
   std::function<std::string()> dev_id_fn_;
 
   // deps

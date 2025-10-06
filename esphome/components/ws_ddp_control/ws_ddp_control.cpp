@@ -35,7 +35,7 @@ void WsDdpOutput::stop() {
 }
 
 void WsDdpOutput::set_src(const std::string &src) {
-  src_const_ = src;
+  src_ = src;
   if (parent_) {
     parent_->send_update(this);
   }
@@ -70,21 +70,21 @@ void WsDdpOutput::set_loop(bool loop) {
 }
 
 void WsDdpOutput::set_hw(const std::string &hw) {
-  hw_const_ = hw;
+  hw_ = hw;
   if (parent_) {
     parent_->send_update(this);
   }
 }
 
 void WsDdpOutput::set_format(const std::string &fmt) {
-  format_const_ = fmt;
+  format_ = fmt;
   if (parent_) {
     parent_->send_update(this);
   }
 }
 
 void WsDdpOutput::set_fit(const std::string &fit) {
-  fit_const_ = fit;
+  fit_ = fit;
   if (parent_) {
     parent_->send_update(this);
   }
@@ -268,10 +268,10 @@ void WsDdpControl::ws_event_trampoline(void *arg,
 // ------------- config/introspection -------------
 void WsDdpControl::dump_config() {
   ESP_LOGCONFIG(TAG, "WebSocket control + orchestration:");
-  if (!url_const_.empty() || (bool)url_fn_) {
+  if (!url_.empty() || (bool)url_fn_) {
     ESP_LOGCONFIG(TAG, "  url: (templated or static)");
   } else {
-    ESP_LOGCONFIG(TAG, "  ws_host: %s", ws_host_const_.c_str());
+    ESP_LOGCONFIG(TAG, "  ws_host: %s", ws_host_.c_str());
     ESP_LOGCONFIG(TAG, "  ws_port: %d", ws_port_);
   }
   ESP_LOGCONFIG(TAG, "  device_id: (templated)");
@@ -292,21 +292,21 @@ void WsDdpControl::dump_config() {
 
     if (output) {
       ESP_LOGCONFIG(TAG, "      src=%s pace=%s ema=%s expand=%s loop=%s hw=%s format=%s",
-                    output->src_const_.c_str(),
+                    output->src_.c_str(),
                     int_or(output->pace_),
                     flt_or(output->ema_),
                     int_or(output->expand_),
                     boo_or(output->loop_),
-                    str_or(output->hw_const_),
-                    str_or(output->format_const_));
+                    str_or(output->hw_),
+                    str_or(output->format_));
     }
   }
 }
 
 std::string WsDdpControl::build_uri_() const {
   if (url_fn_) return url_fn_();
-  if (!url_const_.empty()) return url_const_;
-  const std::string host = ws_host_fn_ ? ws_host_fn_() : ws_host_const_;
+  if (!url_.empty()) return url_;
+  const std::string host = ws_host_fn_ ? ws_host_fn_() : ws_host_;
   if (host.empty()) return {};
   char buf[256];
   snprintf(buf, sizeof(buf), "ws://%s:%d/control", host.c_str(), ws_port_);
@@ -560,8 +560,8 @@ WsDdpControl::StreamCfg WsDdpControl::compute_stream_cfg_(uint8_t out) const {
   const WsDdpOutput* output = (oit != outputs_.end()) ? oit->second.output : nullptr;
 
   // strings first (escaped); src is now required
-  if (output) e.src = json_escape_(output->src_const_);
-  if (output && output->hw_const_) e.hw = json_escape_(*output->hw_const_);
+  if (output) e.src = json_escape_(output->src_);
+  if (output && output->hw_) e.hw = json_escape_(*output->hw_);
 
   // numeric/toggles — propagate only if set in YAML
   if (output && output->pace_) e.pace = *output->pace_;
@@ -570,15 +570,15 @@ WsDdpControl::StreamCfg WsDdpControl::compute_stream_cfg_(uint8_t out) const {
   if (output && output->loop_) e.loop = *output->loop_;
 
   // format → (fmt,pixcfg)
-  if (output && output->format_const_) {
-    auto rp = resolve_fmt_and_pixcfg_(*output->format_const_, ddp_);
+  if (output && output->format_) {
+    auto rp = resolve_fmt_and_pixcfg_(*output->format_, ddp_);
     e.fmt = rp.first;
     e.pixcfg = rp.second;
   }
 
   // fit
-  if (output && output->fit_const_) {
-    e.fit = json_escape_(*output->fit_const_);
+  if (output && output->fit_) {
+    e.fit = json_escape_(*output->fit_);
   }
 
   return e;
