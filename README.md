@@ -17,7 +17,12 @@ This repository provides two ESPHome components:
 
 ### Standalone Usage
 
-The `ddp_stream` component can be used independently with any system that sends DDP packets to UDP port 4048. This includes tools like [WLEDVideoSync](https://github.com/Aircoookie/WLED/wiki/UDP-Realtime-Control#videosync) (though compatibility hasn't been extensively tested). You only need `ws_ddp_control` if you want to use the companion media proxy server for video processing and WebSocket orchestration.
+The `ddp_stream` component can be used independently with any system that sends DDP packets to UDP port 4048. This includes:
+
+- **[LedFx](https://github.com/LedFx/LedFx)** - Real-time music visualization software with excellent DDP support. Works great with this component. **Note:** LedFx always uses stream ID 1, so configure your `ddp_stream` with `stream: 1` for compatibility.
+- **[WLEDVideoSync](https://github.com/Aircoookie/WLED/wiki/UDP-Realtime-Control#videosync)** - Though compatibility hasn't been extensively tested.
+
+You only need `ws_ddp_control` if you want to use the companion media proxy server for video processing and WebSocket orchestration.
 
 ### RGB Format Notes
 
@@ -28,14 +33,18 @@ The `ddp_stream` component can be used independently with any system that sends 
 
 ---
 
-A ready-made example configuration is provided at:
-```
-esphome/examples/page-ddp-stream.yaml
-```
+## Examples
 
-This example demonstrates both components working together with a media proxy server. Move sensitive values like `WS_HOST` and `VIDEO_SRC` to your `secrets.yaml`.
+Two ready-made example configurations are provided:
+
+- **[ddp-receiver-only.yaml](esphome/examples/ddp-receiver-only.yaml)** - Minimal standalone DDP receiver (no WebSocket control). Perfect for use with [LedFx](https://github.com/LedFx/LedFx) or other DDP senders.
+- **[ddp-websocket-full.yaml](esphome/examples/ddp-websocket-full.yaml)** - Complete setup with WebSocket control client for use with the media proxy server.
+
+Move sensitive values like Wi-Fi credentials and video sources to your `secrets.yaml`.
 
 ---
+
+## Configuration Reference
 
 ### `ddp_stream`
 
@@ -44,36 +53,56 @@ ddp_stream:
   id: ddp
   port: 4048
   streams:
-    - id: stream_1              # Required: ESPHome component ID for this stream
-      canvas: canvas64          # Required: LVGL canvas object name
-      width: 64                 # Optional: Override canvas width
-      height: 64                # Optional: Override canvas height
-      # stream: auto            # Optional: DDP stream number (auto-generated if omitted)
+    - id: stream_1
+      canvas: canvas64
+      # stream: 1               # Uncomment and set to 1 for LedFx compatibility
 ```
+
+**Parameters:**
+- `id`: Component identifier for referencing in other components
+- `port`: UDP port to listen on for DDP packets
+- `back_buffers`: Default number of back buffers for smoother rendering (0=no buffering, 1-2=buffered)
+- `streams`: List of DDP stream configurations
+  - `id`: ESPHome component ID for this stream output
+  - `canvas`: Name of the LVGL canvas object to render to
+  - `stream`: DDP stream number (1-249). Use `1` for LedFx compatibility. Auto-generated if omitted.
+  - `width`/`height`: Override canvas dimensions if needed
+  - `back_buffers`: Per-stream back buffer override
 
 ### `ws_ddp_control`
 
 ```yaml
 ws_ddp_control:
-  id: ws                        # Required: Component ID
-  ddp: ddp                      # Required: Reference to ddp_stream component
-  ws_host: ${WS_HOST}           # Optional: WebSocket host (can use url instead)
-  ws_port: 8788                 # Optional: WebSocket port (default: 8788)
-  device_id: "esp32-device"     # Optional: Device identifier (default: "unknown")
-  url: ""                       # Optional: Full WebSocket URL override
-  outputs:                      # Optional: List of output streams
-    - id: output_1              # Required: ESPHome component ID for this output
-      ddp_stream: stream_1      # Required: Reference to ddp_stream's stream component
-      src: ${VIDEO_SRC}         # Required: Video source
-      width: 64                 # Optional: Output width (auto-detected if omitted)
-      height: 64                # Optional: Output height (auto-detected if omitted)
-      format: rgb888            # Optional: Pixel format (rgb888, rgb565, rgb565le, rgb565be)
-      pace: 30                  # Optional: Frame pacing (0-240)
-      ema: 0.2                  # Optional: EMA smoothing (0.0-1.0)
-      expand: auto              # Optional: Scaling (never, auto, force)
-      loop: true                # Optional: Loop video playbook
-      hw: auto                  # Optional: Hardware acceleration (auto, none, cuda, qsv, vaapi, videotoolbox, d3d11va)
+  id: ws
+  ddp: ddp
+  ws_host: "homeassistant.local"
+  ws_port: 8788
+  outputs:
+    - id: output_1
+      ddp_stream: stream_1
+      src: "video.mp4"
+      format: rgb565            # Use rgb565 for better performance on ESP32
 ```
+
+**Parameters:**
+- `id`: Component identifier for referencing in actions
+- `ddp`: Reference to the `ddp_stream` component
+- `ws_host`: Hostname or IP address of media proxy server
+- `ws_port`: WebSocket port on media proxy server
+- `device_id`: Identifier sent to media proxy for device tracking
+- `url`: Full WebSocket URL (overrides `ws_host` and `ws_port` if provided)
+- `outputs`: List of video output configurations
+  - `id`: ESPHome component ID for this output
+  - `ddp_stream`: Reference to a `ddp_stream` stream component
+  - `src`: Video source (local file, HTTP/HTTPS URL, RTSP stream, etc.)
+  - `width`/`height`: Output dimensions (auto-detected from canvas if omitted)
+  - `format`: Pixel format for transmission. The `ddp_stream` component auto-detects rgb565le vs rgb565be. (rgb888 for quality, rgb565 for bandwidth)
+  - `pace`: Frame timing adjustment in milliseconds (negative=speed up, positive=slow down). **Server has good defaults; rarely needs adjustment.**
+  - `ema`: Exponential moving average smoothing for frame timing stability. **Server has good defaults; rarely needs adjustment.**
+  - `expand`: Color range expansion from TV range (16-235) to PC range (0-255). **Server has good defaults; rarely needs adjustment.**
+  - `fit`: How to fit video to canvas (auto=letterbox/pillarbox, pad=always letterbox, cover=fill and crop). **Server defaults to auto.**
+  - `loop`: Whether to loop video playback
+  - `hw`: Hardware acceleration method (depends on media proxy server capabilities). **Server has good defaults; rarely needs adjustment.**
 
 ### Using Actions
 
@@ -109,6 +138,7 @@ The media proxy handles:
 ## Acknowledgements
 
 This project was inspired in part by:
+- [LedFx](https://github.com/LedFx/LedFx) - Real-time music visualization with DDP protocol support
 - [WLED Video Sync](https://github.com/Aircoookie/WLED/wiki/UDP-Realtime-Control#videosync)
 - [DDP Protocol Specification](http://www.3waylabs.com/ddp/)
 
