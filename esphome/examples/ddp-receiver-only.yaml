@@ -44,6 +44,9 @@ ddp_stream:
       canvas: canvas_main
       back_buffers: 1  # 0-2 buffers for smoother rendering
       stream: 1        # Stream ID 1 (default output device for LedFX)
+      receiving:       # Optional: monitor if stream is receiving data
+        name: "Stream 1 Receiving"
+        device_class: connectivity
 
 # LVGL display setup
 lvgl:

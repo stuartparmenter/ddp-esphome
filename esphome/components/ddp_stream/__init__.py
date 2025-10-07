@@ -3,9 +3,11 @@
 
 from esphome import codegen as cg
 import esphome.config_validation as cv
+from esphome.components import binary_sensor
 from esphome.const import CONF_ID, CONF_PORT
 
 DEPENDENCIES = ["network", "lvgl"]
+AUTO_LOAD = ["binary_sensor"]
 
 ddp_ns = cg.esphome_ns.namespace("ddp_stream")
 DdpStream = ddp_ns.class_("DdpStream", cg.Component)
@@ -14,6 +16,7 @@ DdpStreamOutput = ddp_ns.class_("DdpStreamOutput", cg.Component)
 CONF_STREAMS = "streams"
 CONF_CANVAS = "canvas"
 CONF_STREAM = "stream"
+CONF_RECEIVING = "receiving"
 
 STREAM_SCHEMA = cv.Schema({
     cv.GenerateID(): cv.declare_id(DdpStreamOutput),
@@ -22,6 +25,9 @@ STREAM_SCHEMA = cv.Schema({
     cv.Optional("width", default=-1): cv.int_,
     cv.Optional("height", default=-1): cv.int_,
     cv.Optional("back_buffers", default=None): cv.one_of(0, 1, 2, int=True),
+    cv.Optional(CONF_RECEIVING): binary_sensor.binary_sensor_schema(
+        binary_sensor.BinarySensor
+    ),
 })
 
 CONFIG_SCHEMA = cv.Schema({
@@ -82,3 +88,9 @@ async def to_code(config):
         cg.add(stream_component.set_size(s.get("width", -1), s.get("height", -1)))
         if s.get("back_buffers") is not None:
             cg.add(stream_component.set_back_buffers(s["back_buffers"]))
+
+        # Configure optional receiving sensor
+        if CONF_RECEIVING in s:
+            sens = cg.new_Pvariable(s[CONF_RECEIVING][CONF_ID])
+            await binary_sensor.register_binary_sensor(sens, s[CONF_RECEIVING])
+            cg.add(stream_component.set_receiving_sensor(sens))

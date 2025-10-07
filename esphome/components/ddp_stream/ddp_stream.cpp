@@ -20,6 +20,12 @@ void DdpStreamOutput::setup() {
   if (parent_) {
     parent_->register_stream(this, ddp_stream_id_);
   }
+
+  // Initialize receiving sensor to false (not receiving yet)
+  if (receiving_sensor_) {
+    receiving_sensor_->publish_state(false);
+    last_receiving_state_ = false;
+  }
 }
 
 void DdpStreamOutput::dump_config() {
@@ -297,6 +303,19 @@ void DdpStream::loop() {
     }
   }
 #endif
+
+  // Check receiving sensor timeout for each stream (independent of binding state)
+  int64_t now_us = esp_timer_get_time();
+  for (auto &kv : streams_) {
+    DdpStreamOutput &stream = *kv.second;
+    if (stream.receiving_sensor_ && stream.last_receiving_state_) {
+      int64_t last_pkt = stream.last_packet_us_.load(std::memory_order_relaxed);
+      if (last_pkt > 0 && (now_us - last_pkt) > IDLE_TIMEOUT_US) {
+        stream.receiving_sensor_->publish_state(false);
+        stream.last_receiving_state_ = false;
+      }
+    }
+  }
 
   // Loop optimization: disable when idle for 1 second
   if (had_activity) {
@@ -598,7 +617,19 @@ void DdpStream::handle_packet_(const uint8_t *raw, size_t n) {
 
   uint8_t id = h->id;
   DdpStreamOutput *stream = this->find_stream_(id);
-  if (!stream || !stream->canvas_ || stream->buf_px_ == 0) return;
+  if (!stream) return;
+
+  // Update receiving sensor state when packets arrive (regardless of binding state)
+  if (stream->receiving_sensor_) {
+    stream->last_packet_us_.store(esp_timer_get_time(), std::memory_order_relaxed);
+    if (!stream->last_receiving_state_) {
+      stream->receiving_sensor_->publish_state(true);
+      stream->last_receiving_state_ = true;
+    }
+  }
+
+  // If canvas not bound yet, can't render but we've updated the receiving sensor
+  if (!stream->canvas_ || stream->buf_px_ == 0) return;
 
   uint32_t offset = ntohl(h->offset_be);
   uint16_t len    = ntohs(h->length_be);

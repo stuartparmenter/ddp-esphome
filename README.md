@@ -56,6 +56,9 @@ ddp_stream:
     - id: stream_1
       canvas: canvas64
       # stream: 1               # Uncomment and set to 1 for LedFx compatibility
+      receiving:                # Optional: binary sensor for monitoring
+        name: "Stream 1 Receiving"
+        device_class: connectivity
 ```
 
 **Parameters:**
@@ -68,6 +71,11 @@ ddp_stream:
   - `stream`: DDP stream number (1-249). Use `1` for LedFx compatibility. Auto-generated if omitted.
   - `width`/`height`: Override canvas dimensions if needed
   - `back_buffers`: Per-stream back buffer override
+  - `receiving`: Optional binary sensor to track if stream is receiving data
+    - Supports all standard ESPHome binary sensor options (name, device_class, filters, etc.)
+    - State is `ON` when packets are actively being received
+    - State is `OFF` when no packets received for 1 second
+    - Useful for monitoring stream connectivity and debugging
 
 ### `ws_ddp_control`
 

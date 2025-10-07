@@ -3,6 +3,7 @@
 
 #pragma once
 #include "esphome/core/component.h"
+#include "esphome/components/binary_sensor/binary_sensor.h"
 
 extern "C" {
   #include "lvgl.h"
@@ -43,6 +44,7 @@ class DdpStreamOutput : public Component {
   void set_canvas_getter(std::function<lv_obj_t*()> getter) { getter_ = std::move(getter); }
   void set_size(int w, int h) { w_ = w; h_ = h; }
   void set_back_buffers(uint8_t n) { back_buffers_ = (n > 2 ? 2 : n); }
+  void set_receiving_sensor(binary_sensor::BinarySensor* sensor) { receiving_sensor_ = sensor; }
 
   // Stream information
   bool get_size(int *w, int *h) const;
@@ -131,6 +133,11 @@ class DdpStreamOutput : public Component {
 #endif
 
   bool bound_{false};
+
+  // Optional receiving sensor
+  binary_sensor::BinarySensor* receiving_sensor_{nullptr};
+  bool last_receiving_state_{false};
+  std::atomic<int64_t> last_packet_us_{0};  // Track last packet time for timeout
 
   friend class DdpStream;
 };
