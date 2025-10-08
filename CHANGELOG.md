@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3] - 2025-10-08
+
+### Added
+- Optional binary sensor to monitor if data is being received on streams
+- Fit control setting (auto, pad, cover) for video/image display
+- New DDP receiver-only example configuration
+
 ## [0.5.2] - 2025-10-06
 
 ### Fixed
@@ -121,7 +128,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ESPHome external components: `ddp_stream`, `ws_ddp_control`
 - Example LVGL page: `page-ddp-stream.yaml`
 
-[unreleased]: https://github.com/stuartparmenter/lvgl-ddp-stream/compare/v0.5.2...HEAD
+[unreleased]: https://github.com/stuartparmenter/lvgl-ddp-stream/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/stuartparmenter/lvgl-ddp-stream/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/stuartparmenter/lvgl-ddp-stream/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/stuartparmenter/lvgl-ddp-stream/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/stuartparmenter/lvgl-ddp-stream/compare/v0.4.3...v0.5.0
