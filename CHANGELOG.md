@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- mDNS/Zeroconf network discovery as `_ddp._udp.local.` service
+- DDP mDNS Discovery Specification document (DDP-MDNS-DISCOVERY.md)
+
 ## [0.5.3] - 2025-10-08
 
 ### Added

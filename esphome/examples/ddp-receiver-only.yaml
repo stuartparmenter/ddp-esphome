@@ -40,6 +40,7 @@ external_components:
     components: [ddp_stream]
 
 # UDP DDP receiver - listens on port 4048 (default)
+# Automatically advertises via mDNS as _ddp._udp.local. (see DDP-MDNS-DISCOVERY.md)
 ddp_stream:
   id: ddp
   port: 4048
@@ -47,7 +48,9 @@ ddp_stream:
     - id: stream1
       canvas: canvas_main
       back_buffers: 1  # 0-2 buffers for smoother rendering
-      stream: 1        # Stream ID 1 (default output device for LedFX)
+      stream: 1        # Stream ID 1 (default output device for LedFx)
+      width: 320       # Explicit dimensions enable discovery tools to know resolution via mDNS
+      height: 240      # Without these, dimensions are determined from canvas at runtime
       receiving:       # Optional: monitor if stream is receiving data
         name: "Stream 1 Receiving"
         device_class: connectivity

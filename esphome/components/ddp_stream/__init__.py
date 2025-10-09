@@ -3,11 +3,12 @@
 
 from esphome import codegen as cg
 import esphome.config_validation as cv
-from esphome.components import binary_sensor
+from esphome.components import binary_sensor, mdns
+from esphome.components.mdns import MDNSComponent
 from esphome.const import CONF_ID, CONF_PORT
 
 DEPENDENCIES = ["network", "lvgl"]
-AUTO_LOAD = ["binary_sensor"]
+AUTO_LOAD = ["binary_sensor", "mdns"]
 
 ddp_ns = cg.esphome_ns.namespace("ddp_stream")
 DdpStream = ddp_ns.class_("DdpStream", cg.Component)
@@ -17,6 +18,7 @@ CONF_STREAMS = "streams"
 CONF_CANVAS = "canvas"
 CONF_STREAM = "stream"
 CONF_RECEIVING = "receiving"
+CONF_MDNS_ID = "mdns_id"
 
 STREAM_SCHEMA = cv.Schema({
     cv.GenerateID(): cv.declare_id(DdpStreamOutput),
@@ -32,10 +34,62 @@ STREAM_SCHEMA = cv.Schema({
 
 CONFIG_SCHEMA = cv.Schema({
     cv.GenerateID(): cv.declare_id(DdpStream),
+    cv.GenerateID(CONF_MDNS_ID): cv.use_id(MDNSComponent),
     cv.Optional(CONF_PORT, default=4048): cv.port,
     cv.Optional(CONF_STREAMS, default=[]): cv.ensure_list(STREAM_SCHEMA),
     cv.Optional("back_buffers", default=0): cv.one_of(0, 1, 2, int=True),
 })
+
+async def _register_mdns_service(config, stream_configs):
+    """Register mDNS service for DDP stream discovery (RFC 6763 compliant).
+
+    Args:
+        config: Component configuration dict
+        stream_configs: List of dicts with 'ddp_id' (int) and 'width'/'height' (int, optional)
+    """
+    # Enable extra services support in mDNS component
+    cg.add_define("USE_MDNS_EXTRA_SERVICES")
+
+    mdns_comp = await cg.get_variable(config[CONF_MDNS_ID])
+
+    # Build TXT records following RFC 6763 conventions:
+    # - Keys are lowercase ASCII, ≤9 characters recommended
+    # - txtvers: TXT record format version (increment only if format breaks compatibility)
+    # - protovers: DDP protocol version (1-3, matches 2-bit version field in DDP header)
+    txt_records = []
+    txt_records.append(mdns.mdns_txt_record("txtvers", "1"))
+    txt_records.append(mdns.mdns_txt_record("protovers", "1"))
+    txt_records.append(mdns.mdns_txt_record("fmts", "rgb888,rgb565"))
+
+    # Add DDP Destination ID information (using DDP protocol terminology)
+    if stream_configs:
+        ddp_id_list = []
+
+        for stream_cfg in stream_configs:
+            ddp_id = stream_cfg['ddp_id']
+            ddp_id_list.append(ddp_id)
+
+            # If explicit dimensions, add to TXT records (e.g., "id1=64x64")
+            width = stream_cfg.get('width', -1)
+            height = stream_cfg.get('height', -1)
+            if width > 0 and height > 0:
+                txt_records.append(
+                    mdns.mdns_txt_record(f"id{ddp_id}", f"{width}x{height}")
+                )
+
+        # Sort DDP IDs numerically and advertise (e.g., "ids=1,2,3")
+        ddp_id_list.sort()
+        txt_records.append(mdns.mdns_txt_record("ids", ",".join(str(s) for s in ddp_id_list)))
+
+    # Create and register mDNS service
+    service = mdns.mdns_service(
+        "_ddp",              # service name
+        "_udp",              # protocol
+        config[CONF_PORT],   # port
+        txt_records          # TXT records
+    )
+
+    cg.add(mdns_comp.add_extra_service(service))
 
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
@@ -56,7 +110,10 @@ async def to_code(config):
         if CONF_STREAM in s:
             used_stream_numbers.add(s[CONF_STREAM])
 
-    # Second pass: assign auto-generated DDP stream numbers and create bindings
+    # Second pass: assign auto-generated DDP stream numbers and create components
+    # Build stream info list for mDNS registration
+    stream_configs = []
+
     for s in streams:
         if CONF_STREAM in s:
             ddp_stream_num = s[CONF_STREAM]
@@ -94,3 +151,13 @@ async def to_code(config):
             sens = cg.new_Pvariable(s[CONF_RECEIVING][CONF_ID])
             await binary_sensor.register_binary_sensor(sens, s[CONF_RECEIVING])
             cg.add(stream_component.set_receiving_sensor(sens))
+
+        # Collect stream info for mDNS registration
+        stream_configs.append({
+            'ddp_id': ddp_stream_num,
+            'width': s.get("width", -1),
+            'height': s.get("height", -1),
+        })
+
+    # Register mDNS service for network discovery
+    await _register_mdns_service(config, stream_configs)

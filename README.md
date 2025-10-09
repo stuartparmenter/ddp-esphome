@@ -6,6 +6,10 @@
 
 ESPHome external components for streaming images/video to **LVGL** canvases via **DDP** (Distributed Display Protocol) over UDP.
 
+**📚 Documentation:**
+- [DDP Protocol Specification](http://www.3waylabs.com/ddp/) - Official DDP protocol documentation
+- [DDP mDNS Discovery Spec](DDP-MDNS-DISCOVERY.md) - Zero-configuration network discovery (our extension to DDP)
+
 ## Components
 
 This repository provides two ESPHome components:
@@ -24,12 +28,11 @@ The `ddp_stream` component can be used independently with any system that sends 
 
 You only need `ws_ddp_control` if you want to use the companion media proxy server for video processing and WebSocket orchestration.
 
-### RGB Format Notes
+### Pixel Format Notes
 
-- **Default format**: RGB888 (24-bit, flag 0x2C) is the default format used by the media proxy server (as specified in the DDP protocol)
-- **Recommended format**: RGB565 (16-bit, flags 0x61/0x62) is typically better for ESP32 devices since LVGL normally runs in 565 mode and uses less bandwidth
-- **Extension support**: RGB565 formats are an extension to the DDP spec; our media proxy may be the only implementation that supports them
-- **Automatic rendering**: The `ddp_stream` component automatically renders whatever pixel format it receives (RGB888, RGB565LE, or RGB565BE) as long as the DDP packet flags are set correctly
+- **RGB888** (24-bit, DDP type `0x0B`): Standard DDP format, 8 bits per channel. Used by most DDP implementations including WLED and LedFx.
+- **RGB565** (16-bit, DDP type `0x61` little-endian / `0x62` big-endian): Extension to DDP spec. Recommended for ESP32 since LVGL typically runs in 16-bit color mode. Reduces bandwidth by ~33%.
+- **Automatic rendering**: The `ddp_stream` component automatically renders whatever pixel format it receives (RGB888, RGB565LE, or RGB565BE) as long as the DDP packet type flags are set correctly.
 
 ---
 
@@ -120,6 +123,42 @@ ws_ddp_control:
     id: output_1                # Reference the WsDdpOutput component directly
     src: "new_video.mp4"
 ```
+
+---
+
+## Network Discovery
+
+The `ddp_stream` component automatically advertises via **mDNS/Zeroconf** as `_ddp._udp.local.` for zero-configuration discovery on the local network.
+
+**📖 Full Discovery Specification:** See [DDP-MDNS-DISCOVERY.md](DDP-MDNS-DISCOVERY.md) for complete technical details, TXT record format, and implementation guidelines.
+
+**Note:** While other DDP senders could use mDNS to find devices, most current implementations don't implement discovery yet.
+
+### Quick Start
+
+Devices advertise with these TXT records:
+- `txtvers=1` - TXT record format version
+- `protovers=1` - DDP protocol version
+- `fmts=rgb888,rgb565` - Supported pixel formats
+- `ids=1,2,3` - Available DDP Destination IDs
+- `id1=64x64` - Optional: Dimensions for each ID
+
+### Configuring Discovery
+
+To advertise display dimensions via mDNS, configure explicit `width` and `height`:
+
+```yaml
+ddp_stream:
+  streams:
+    - canvas: my_canvas
+      stream: 1
+      width: 64      # Advertised via mDNS for discovery
+      height: 64     # Without these, dimensions are determined from canvas at runtime
+```
+
+**Note:** If width/height are not specified, the stream will still work (dimensions come from the bound canvas), but senders won't know the resolution in advance.
+
+**Network considerations:** mDNS works reliably on most home/office networks but may be filtered on enterprise networks with strict multicast policies.
 
 ---
 
