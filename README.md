@@ -4,7 +4,7 @@
 [![ESPHome](https://img.shields.io/badge/ESPHome-2025.8-blue)](https://esphome.io/)
 [![ESP-IDF](https://img.shields.io/badge/ESP--IDF-5.x-orange)](https://docs.espressif.com/projects/esp-idf/)
 
-ESPHome external components for streaming images/video to **LVGL** canvases via **DDP** (Distributed Display Protocol) over UDP.
+ESPHome external components for streaming images/video to **LVGL** canvases and **AddressableLight** LED strips via **DDP** (Distributed Display Protocol) over UDP.
 
 **📚 Documentation:**
 - [DDP Protocol Specification](http://www.3waylabs.com/ddp/) - Official DDP protocol documentation
@@ -12,36 +12,54 @@ ESPHome external components for streaming images/video to **LVGL** canvases via 
 
 ## Components
 
-This repository provides two ESPHome components:
+This repository provides a modular set of ESPHome components:
 
-- **`ddp_stream`**: UDP server that receives DDP packets and renders them to LVGL canvases
-- **`ws_ddp_control`**: WebSocket client for orchestrating video playback via a media proxy server
+### Core Components
+- **`ddp`**: Core UDP server that receives DDP packets and dispatches to renderers
+- **`ddp_canvas`**: LVGL canvas renderer with triple-buffering support
+- **`ddp_light_effect`**: AddressableLight effect for RGB/RGBW LED strips
+- **`media_proxy_control`**: WebSocket client for orchestrating video playback via a media proxy server
+
+### Legacy Components (Deprecated)
+- **`ddp_stream`**: Old monolithic component (replaced by `ddp` + `ddp_canvas`)
+- **`ws_ddp_control`**: Old WebSocket component (replaced by `media_proxy_control`)
+
+> **Migration Note:** Existing configurations using `ddp_stream` and `ws_ddp_control` will continue to work, but new projects should use the new modular components for better flexibility and features.
 
 > Tested with **ESPHome 2025.8** (ESP-IDF only). Arduino is **not** supported.
 
 ### Standalone Usage
 
-The `ddp_stream` component can be used independently with any system that sends DDP packets to UDP port 4048. This includes:
+The `ddp` component can be used independently with any system that sends DDP packets to UDP port 4048. This includes:
 
-- **[LedFx](https://github.com/LedFx/LedFx)** - Real-time music visualization software with excellent DDP support. Works great with this component. **Note:** LedFx always uses stream ID 1, so configure your `ddp_stream` with `stream: 1` for compatibility.
+- **[LedFx](https://github.com/LedFx/LedFx)** - Real-time music visualization software with excellent DDP support. Works great with this component. **Note:** LedFx always uses stream ID 1, so configure your renderer with `stream: 1` for compatibility.
 - **[WLEDVideoSync](https://github.com/Aircoookie/WLED/wiki/UDP-Realtime-Control#videosync)** - Though compatibility hasn't been extensively tested.
 
-You only need `ws_ddp_control` if you want to use the companion media proxy server for video processing and WebSocket orchestration.
+You only need `media_proxy_control` if you want to use the companion media proxy server for video processing and WebSocket orchestration.
 
 ### Pixel Format Notes
 
 - **RGB888** (24-bit, DDP type `0x0B`): Standard DDP format, 8 bits per channel. Used by most DDP implementations including WLED and LedFx.
-- **RGB565** (16-bit, DDP type `0x61` little-endian / `0x62` big-endian): Extension to DDP spec. Recommended for ESP32 since LVGL typically runs in 16-bit color mode. Reduces bandwidth by ~33%.
-- **Automatic rendering**: The `ddp_stream` component automatically renders whatever pixel format it receives (RGB888, RGB565LE, or RGB565BE) as long as the DDP packet type flags are set correctly.
+- **RGB565** (16-bit, DDP type `0x62` little-endian / `0x61` big-endian): Extension to DDP spec. Recommended for ESP32 since LVGL typically runs in 16-bit color mode. Reduces bandwidth by ~33%.
+- **RGBW** (32-bit, DDP type `0x1B`): Standard DDP format with white channel. Perfect for RGBW LED strips.
+- **Automatic rendering**: The components automatically render whatever pixel format they receive (RGB888, RGB565LE, RGB565BE, or RGBW) as long as the DDP packet type flags are set correctly.
 
 ---
 
 ## Examples
 
-Two ready-made example configurations are provided:
+Multiple ready-made example configurations are provided:
 
-- **[ddp-receiver-only.yaml](esphome/examples/ddp-receiver-only.yaml)** - Minimal standalone DDP receiver (no WebSocket control). Perfect for use with [LedFx](https://github.com/LedFx/LedFx) or other DDP senders.
-- **[ddp-websocket-full.yaml](esphome/examples/ddp-websocket-full.yaml)** - Complete setup with WebSocket control client for use with the media proxy server.
+**New Modular Components:**
+- **[media-proxy-canvas.yaml](esphome/examples/media-proxy-canvas.yaml)** - **Recommended starting point**: Canvas video streaming with media proxy control
+- **[ddp-test-canvas.yaml](esphome/examples/ddp-test-canvas.yaml)** - Minimal standalone canvas example (no media proxy)
+- **[ddp-test-light-rgb.yaml](esphome/examples/ddp-test-light-rgb.yaml)** - RGB LED strip streaming
+- **[ddp-test-light-rgbw.yaml](esphome/examples/ddp-test-light-rgbw.yaml)** - RGBW LED strip streaming
+- **[ddp-test-multi-renderer.yaml](esphome/examples/ddp-test-multi-renderer.yaml)** - Advanced: Mirror same stream to canvas AND LEDs simultaneously
+
+**Legacy Components (still functional):**
+- **[ddp-receiver-only.yaml](esphome/examples/ddp-receiver-only.yaml)** - Standalone DDP receiver using legacy `ddp_stream`
+- **[ddp-websocket-full.yaml](esphome/examples/ddp-websocket-full.yaml)** - Full setup using legacy `ws_ddp_control`
 
 Move sensitive values like Wi-Fi credentials and video sources to your `secrets.yaml`.
 

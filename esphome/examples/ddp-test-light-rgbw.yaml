@@ -1,0 +1,48 @@
+# © Copyright 2025 Stuart Parmenter
+# SPDX-License-Identifier: MIT
+
+# Test configuration for new modular DDP architecture
+# Tests: ddp core component + ddp_light_effect renderer (RGBW LEDs)
+
+esphome:
+  name: ddp-test-light-rgbw
+  friendly_name: DDP Light RGBW Test
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+logger:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+external_components:
+  - source: github://stuartparmenter/lvgl-ddp-stream@main
+    components: [ddp]
+    refresh: 0s
+
+# Core DDP component - handles UDP reception and protocol
+ddp:
+  id: ddp_server
+  port: 4048
+
+# RGBW LED strip configuration
+light:
+  - platform: esp32_rmt_led_strip
+    id: rgbw_strip
+    rgb_order: GRBW
+    pin: GPIO5
+    num_leds: 100
+    rmt_channel: 0
+    chipset: SK6812
+    name: "RGBW LED Strip"
+    effects:
+      - ddp_light_effect:
+          name: "DDP RGBW Stream"
+          ddp_id: ddp_server
+          stream: 1
+          width: 10
+          height: 10

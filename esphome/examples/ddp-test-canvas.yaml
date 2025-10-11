@@ -1,0 +1,69 @@
+# © Copyright 2025 Stuart Parmenter
+# SPDX-License-Identifier: MIT
+
+# Test configuration for new modular DDP architecture
+# Tests: ddp core component + ddp_canvas renderer
+
+esphome:
+  name: ddp-test-canvas
+  friendly_name: DDP Canvas Test
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+logger:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+external_components:
+  - source: github://stuartparmenter/lvgl-ddp-stream@main
+    components: [ddp, ddp_canvas]
+    refresh: 0s
+
+# Core DDP component - handles UDP reception and protocol
+ddp:
+  id: ddp_server
+  port: 4048
+
+# Canvas renderer - renders DDP stream to LVGL canvas
+ddp_canvas:
+  - id: canvas_renderer_1
+    ddp_id: ddp_server
+    stream: 1
+    canvas: canvas_main
+    width: 320
+    height: 240
+    back_buffers: 2
+    receiving:
+      name: "Stream 1 Active"
+
+# LVGL setup (minimal for testing)
+lvgl:
+  displays:
+    - display_id: my_display
+
+  pages:
+    - id: page_main
+      widgets:
+        - canvas:
+            id: canvas_main
+            width: 320
+            height: 240
+
+# Dummy display (replace with real display in actual use)
+display:
+  - platform: ili9xxx
+    id: my_display
+    model: ST7789V
+    dimensions:
+      width: 320
+      height: 240
+    cs_pin: GPIO10
+    dc_pin: GPIO11
+    reset_pin: GPIO12
+    auto_clear_enabled: false
+    update_interval: never

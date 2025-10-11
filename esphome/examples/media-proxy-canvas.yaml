@@ -1,0 +1,139 @@
+# © Copyright 2025 Stuart Parmenter
+# SPDX-License-Identifier: MIT
+#
+# Example: Media Proxy Control with Canvas Rendering
+#
+# This example demonstrates a simple setup for video streaming:
+# - DDP core component receives video frames via UDP
+# - ddp_canvas renders frames to an LVGL canvas
+# - media_proxy_control connects to media-proxy server for orchestration
+# - Runtime source control via Home Assistant text entity
+#
+# Prerequisites:
+#   - Running media-proxy server (https://github.com/stuartparmenter/media-proxy)
+#   - Network connectivity between ESP32 and media-proxy server
+#
+# Tested with ESPHome 2025.8 (ESP-IDF only)
+
+substitutions:
+  device_name: "esp32-video-display"
+  media_proxy_host: "homeassistant.local"  # Replace with your media-proxy server
+
+esphome:
+  name: ${device_name}
+  friendly_name: "Video Display"
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+# External components - pull from GitHub
+external_components:
+  - source: github://stuartparmenter/lvgl-ddp-stream@main
+    components: [ddp, ddp_canvas, media_proxy_control]
+    refresh: 0s
+
+# Core DDP component - receives video frames via UDP
+ddp:
+  id: ddp_server
+  port: 4048
+
+# Canvas renderer - renders DDP stream to LVGL canvas
+ddp_canvas:
+  - id: video_canvas
+    ddp_id: ddp_server
+    stream: 1              # Stream ID (use 1 for LedFx compatibility)
+    canvas: main_canvas
+    back_buffers: 2        # Triple-buffering for smooth rendering
+    receiving:             # Optional: monitor receiving status
+      name: "Video Stream Active"
+      device_class: connectivity
+
+# Media proxy control - orchestrates video playback
+media_proxy_control:
+  id: media_proxy
+  ws_host: ${media_proxy_host}
+  ws_port: 8788
+  device_id: ${device_name}
+  ddp: ddp_server
+
+  outputs:
+    - id: main_video
+      stream: video_canvas         # Reference canvas component
+      src: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
+      format: "rgb565le"           # Use rgb565 for bandwidth savings
+      loop: true
+
+# Display driver - replace with your actual display
+# This example uses ST7789V, adjust for your hardware
+display:
+  - platform: st7789v
+    id: my_display
+    model: Custom
+    dimensions:
+      width: 320
+      height: 240
+    cs_pin: GPIO10
+    dc_pin: GPIO11
+    reset_pin: GPIO12
+    auto_clear_enabled: false      # Required for LVGL
+    update_interval: never         # Required for LVGL
+
+# LVGL configuration
+lvgl:
+  displays:
+    - display_id: my_display
+
+  pages:
+    - id: video_page
+      widgets:
+        - canvas:
+            id: main_canvas
+            width: 320
+            height: 240
+
+# Automation: Auto-start playback when page loads
+      on_load:
+        - lambda: |-
+            id(media_proxy).connect();
+            id(main_video).start();
+
+      on_unload:
+        - lambda: |-
+            id(main_video).stop();
+            id(media_proxy).disconnect();
+
+# Optional: Control video source from Home Assistant
+text:
+  - platform: template
+    id: video_source
+    name: "Video Source URL"
+    optimistic: true
+    initial_value: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
+    mode: text
+    on_value:
+      - media_proxy_control.set_source:
+          id: main_video
+          src: !lambda "return x;"
+
+# Optional: Manual playback controls
+button:
+  - platform: template
+    name: "Play Video"
+    on_press:
+      - media_proxy_control.start:
+          id: main_video
+
+  - platform: template
+    name: "Stop Video"
+    on_press:
+      - media_proxy_control.stop:
+          id: main_video
