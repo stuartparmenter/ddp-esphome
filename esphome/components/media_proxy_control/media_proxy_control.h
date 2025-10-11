@@ -30,19 +30,18 @@ class MediaProxyOutput : public Component {
   void set_parent(MediaProxyControl* parent) { parent_ = parent; }
 
   // Configuration setters
-  void set_src(const std::string& src) { src_ = src; }
-  void set_pace(int pace) { pace_ = pace; }
-  void set_ema(float ema) { ema_ = ema; }
-  void set_expand(int expand) { expand_ = expand; }
-  void set_loop(bool loop) { loop_ = loop; }
-  void set_hw(const std::string& hw) { hw_ = hw; }
-  void set_format(const std::string& fmt) { format_ = fmt; }
-  void set_fit(const std::string& fit) { fit_ = fit; }
+  void set_src(const std::string& src);
+  void set_pace(int pace);
+  void set_ema(float ema);
+  void set_expand(int expand);
+  void set_loop(bool loop);
+  void set_hw(const std::string& hw);
+  void set_format(const std::string& fmt);
+  void set_fit(const std::string& fit);
 
   // Actions (for automations)
   void start();
   void stop();
-  void set_source(const std::string& src);
 
   // ESPHome lifecycle
   void setup() override {}

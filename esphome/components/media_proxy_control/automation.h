@@ -18,7 +18,7 @@ template<typename... Ts> class SetSourceAction : public Action<Ts...> {
   void play(Ts... x) override {
     std::string src = this->src_.value(x...);
     if (output_) {
-      output_->set_source(src);
+      output_->set_src(src);
     }
   }
 

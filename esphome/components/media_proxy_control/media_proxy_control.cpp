@@ -34,8 +34,57 @@ void MediaProxyOutput::stop() {
   }
 }
 
-void MediaProxyOutput::set_source(const std::string &src) {
+void MediaProxyOutput::set_src(const std::string &src) {
   src_ = src;
+  if (parent_) {
+    parent_->send_update(stream_id_);
+  }
+}
+
+void MediaProxyOutput::set_pace(int pace) {
+  pace_ = pace;
+  if (parent_) {
+    parent_->send_update(stream_id_);
+  }
+}
+
+void MediaProxyOutput::set_ema(float ema) {
+  ema_ = ema;
+  if (parent_) {
+    parent_->send_update(stream_id_);
+  }
+}
+
+void MediaProxyOutput::set_expand(int expand) {
+  expand_ = expand;
+  if (parent_) {
+    parent_->send_update(stream_id_);
+  }
+}
+
+void MediaProxyOutput::set_loop(bool loop) {
+  loop_ = loop;
+  if (parent_) {
+    parent_->send_update(stream_id_);
+  }
+}
+
+void MediaProxyOutput::set_hw(const std::string &hw) {
+  hw_ = hw;
+  if (parent_) {
+    parent_->send_update(stream_id_);
+  }
+}
+
+void MediaProxyOutput::set_format(const std::string &fmt) {
+  format_ = fmt;
+  if (parent_) {
+    parent_->send_update(stream_id_);
+  }
+}
+
+void MediaProxyOutput::set_fit(const std::string &fit) {
+  fit_ = fit;
   if (parent_) {
     parent_->send_update(stream_id_);
   }

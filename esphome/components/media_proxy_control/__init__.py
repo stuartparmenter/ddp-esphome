@@ -139,8 +139,6 @@ async def to_code(config):
         output = cg.new_Pvariable(s[CONF_ID])
         await cg.register_component(output, s)
         cg.add(output.set_stream_id(stream_id))
-        cg.add(output.set_parent(var))
-        cg.add(var.register_output(output, stream_id))
 
         # Handle expand enum/int
         exp = s.get("expand", "auto")
@@ -153,7 +151,7 @@ async def to_code(config):
             elif e in ("force", "2"): exp_i = 2
             else:                     exp_i = 1
 
-        # Set all configuration
+        # Set all configuration before wiring up parent (avoids spurious updates during init)
         if "src" in s: cg.add(output.set_src(s["src"]))
         if "pace" in s: cg.add(output.set_pace(s["pace"]))
         if "ema" in s: cg.add(output.set_ema(s["ema"]))
@@ -162,5 +160,9 @@ async def to_code(config):
         if "hw" in s: cg.add(output.set_hw(s["hw"]))
         if "format" in s: cg.add(output.set_format(s["format"]))
         if "fit" in s: cg.add(output.set_fit(s["fit"]))
+
+        # Wire up parent last, after all configuration is set
+        cg.add(output.set_parent(var))
+        cg.add(var.register_output(output, stream_id))
 
     add_idf_component(name="espressif/esp_websocket_client", ref="1.5.0")
