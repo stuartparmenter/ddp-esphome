@@ -17,6 +17,25 @@ enum class PixelFormat {
   UNKNOWN
 };
 
+#ifdef DDP_METRICS
+// Renderer performance metrics (optional)
+// Renderers can track and report their own metrics
+struct RendererMetrics {
+  // Frame presentation
+  uint32_t frames_presented{0};      // Total frames actually rendered/presented
+
+  // Latency tracking (EWMA)
+  double present_lat_us_ewma{0.0};   // Time from first packet to presentation
+  double queue_wait_ms_ewma{0.0};    // Time spent in ready queue
+
+  // Coverage (EWMA)
+  double coverage_ewma{0.0};         // Frame completeness (0.0-1.0)
+
+  // Windowed counters (reset every metrics interval)
+  uint32_t win_frames_presented{0};
+};
+#endif
+
 // Abstract renderer interface
 // All DDP renderers (canvas, light effect, etc.) implement this interface
 //
@@ -55,6 +74,16 @@ class DdpRenderer {
 
   // Get renderer's name for logging
   virtual const char* get_name() const = 0;
+
+#ifdef DDP_METRICS
+  // Get renderer metrics (optional, returns nullptr if not implemented)
+  // Called from main thread during metrics logging
+  virtual const RendererMetrics* get_metrics() const { return nullptr; }
+
+  // Reset windowed metrics counters (called after logging)
+  // Called from main thread during metrics logging
+  virtual void reset_windowed_metrics() {}
+#endif
 };
 
 }  // namespace ddp

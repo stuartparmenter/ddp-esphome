@@ -24,9 +24,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#ifndef DDP_METRICS
-#define DDP_METRICS 1
-#endif
+// DDP_METRICS is set via build flag in __init__.py if metrics: true
 
 namespace esphome {
 namespace ddp {
@@ -131,21 +129,13 @@ class DdpComponent : public Component {
     // Frame accounting
     uint32_t frames_started{0};
     uint32_t frames_push{0};
-    uint32_t frames_ok{0};
-    uint32_t frames_incomplete{0};
-    uint32_t frames_dispatched{0};
 
     // Sequencing
-    uint8_t last_seq_push{0};
-    bool have_last_seq{false};
-    uint32_t push_seq_misses{0};
     uint8_t last_seq_pkt{0};
     bool have_last_seq_pkt{false};
-    uint32_t pkt_seq_gaps{0};
 
     // EWMA
     double dispatch_lat_us_ewma{0.0};  // Time from first packet to dispatch
-    double coverage_ewma{0.0};          // Frame completeness percentage
     double build_ms_ewma{0.0};          // Frame build time (first to last packet)
 
     // RX slice behavior
@@ -155,7 +145,6 @@ class DdpComponent : public Component {
     // Windowed (2s) counters
     int64_t log_t0_us{0};
     uint32_t win_frames_push{0};
-    uint32_t win_frames_dispatched{0};
     uint64_t win_rx_bytes{0};        // payload only
     uint64_t win_rx_wire_bytes{0};   // UDP payload (wire)
     uint32_t win_pkt_gap{0};

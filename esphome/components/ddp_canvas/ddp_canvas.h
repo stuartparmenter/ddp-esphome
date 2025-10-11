@@ -36,6 +36,10 @@ class DdpCanvas : public Component, public DdpRenderer {
   uint8_t get_stream_id() const override { return stream_id_; }
   bool get_dimensions(int* w, int* h) const override;
   const char* get_name() const override { return "DdpCanvas"; }
+#ifdef DDP_METRICS
+  const RendererMetrics* get_metrics() const override { return &metrics_; }
+  void reset_windowed_metrics() override;
+#endif
 
   // ESPHome lifecycle
   void setup() override;
@@ -76,6 +80,16 @@ class DdpCanvas : public Component, public DdpRenderer {
   binary_sensor::BinarySensor* receiving_sensor_{nullptr};
   bool last_receiving_state_{false};
   std::atomic<int64_t> last_frame_us_{0};  // Track last frame time for timeout
+
+#ifdef DDP_METRICS
+  // Performance metrics
+  RendererMetrics metrics_;
+
+  // Frame assembly tracking (for coverage calculation)
+  std::atomic<size_t> frame_bytes_accum_{0};
+  std::atomic<int64_t> frame_first_pkt_us_{0};
+  std::atomic<int64_t> ready_set_us_{0};  // When frame became ready (for queue wait)
+#endif
 };
 
 }  // namespace ddp

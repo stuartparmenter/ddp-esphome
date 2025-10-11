@@ -63,6 +63,23 @@ void DdpCanvas::on_data(size_t offset_px, const uint8_t* pixels,
     need_sensor_update_.store(true, std::memory_order_relaxed);
   }
 
+#ifdef DDP_METRICS
+  // Track frame assembly (for coverage calculation)
+  if (frame_bytes_accum_.load(std::memory_order_relaxed) == 0) {
+    // First packet in frame
+    frame_first_pkt_us_.store(esp_timer_get_time(), std::memory_order_relaxed);
+  }
+
+  // Accumulate bytes received (depends on format)
+  size_t bytes = 0;
+  if (format == PixelFormat::RGB888) {
+    bytes = pixel_count * 3;
+  } else if (format == PixelFormat::RGB565_BE || format == PixelFormat::RGB565_LE) {
+    bytes = pixel_count * 2;
+  }
+  frame_bytes_accum_.fetch_add(bytes, std::memory_order_relaxed);
+#endif
+
   // Select destination buffer
   uint16_t* dst_buf = nullptr;
   if (back_buffers_ == 0) {
@@ -139,6 +156,24 @@ void DdpCanvas::on_data(size_t offset_px, const uint8_t* pixels,
 
 void DdpCanvas::on_push() {
   // UDP TASK CONTEXT - no LVGL or ESPHome APIs allowed!
+
+#ifdef DDP_METRICS
+  // Calculate coverage (pure math, safe in UDP task)
+  size_t bytes_received = frame_bytes_accum_.load(std::memory_order_relaxed);
+  size_t expected_bytes = buf_px_ * BYTES_PER_PIXEL;
+  double coverage = (expected_bytes > 0) ? std::min(1.0, (double)bytes_received / (double)expected_bytes) : 0.0;
+
+  // Update coverage EWMA
+  constexpr double ALPHA = 0.2;
+  double prev_cov = metrics_.coverage_ewma;
+  metrics_.coverage_ewma = (prev_cov == 0.0) ? coverage : (ALPHA * coverage + (1.0 - ALPHA) * prev_cov);
+
+  // Mark timestamp when frame became ready
+  ready_set_us_.store(esp_timer_get_time(), std::memory_order_relaxed);
+
+  // Reset frame assembly tracking for next frame
+  frame_bytes_accum_.store(0, std::memory_order_relaxed);
+#endif
 
   // Swap buffers and set atomic flags based on buffer mode
   if (back_buffers_ == 2) {
@@ -231,12 +266,44 @@ void DdpCanvas::loop() {
   }
 
   // Invalidate canvas if needed (LVGL API - must be on main thread)
+  // This is where actual presentation happens, so track metrics here
   if (need_invalidate_.exchange(false)) {
     if (canvas_) {
       lv_obj_invalidate(canvas_);
     }
+
+#ifdef DDP_METRICS
+    // Update presentation metrics (all buffer modes)
+    int64_t now_us = esp_timer_get_time();
+    metrics_.frames_presented++;
+    metrics_.win_frames_presented++;
+
+    // Calculate present latency (first packet → presentation)
+    int64_t first_pkt = frame_first_pkt_us_.load(std::memory_order_relaxed);
+    if (first_pkt > 0) {
+      double lat_us = (double)(now_us - first_pkt);
+      constexpr double ALPHA = 0.2;
+      double prev = metrics_.present_lat_us_ewma;
+      metrics_.present_lat_us_ewma = (prev == 0.0) ? lat_us : (ALPHA * lat_us + (1.0 - ALPHA) * prev);
+    }
+
+    // Calculate queue wait time (ready set → presentation)
+    int64_t ready_time = ready_set_us_.load(std::memory_order_relaxed);
+    if (ready_time > 0) {
+      double wait_ms = (double)(now_us - ready_time) / 1000.0;
+      constexpr double ALPHA = 0.2;
+      double prev = metrics_.queue_wait_ms_ewma;
+      metrics_.queue_wait_ms_ewma = (prev == 0.0) ? wait_ms : (ALPHA * wait_ms + (1.0 - ALPHA) * prev);
+    }
+#endif
   }
 }
+
+#ifdef DDP_METRICS
+void DdpCanvas::reset_windowed_metrics() {
+  metrics_.win_frames_presented = 0;
+}
+#endif
 
 void DdpCanvas::dump_config() {
   // Note: DDP component already logs stream ID and dimensions

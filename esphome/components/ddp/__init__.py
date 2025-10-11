@@ -18,6 +18,7 @@ DdpLightEffect = ddp_ns.class_("DdpLightEffect", AddressableLightEffect)
 # Configuration keys
 CONF_DDP_ID = "ddp_id"
 CONF_STREAM = "stream"
+CONF_METRICS = "metrics"
 
 # Shared stream ID registry (used by ddp_canvas and ddp_light_effect)
 _used_stream_ids = set()
@@ -49,12 +50,17 @@ def allocate_stream_id():
 CONFIG_SCHEMA = cv.Schema({
     cv.GenerateID(): cv.declare_id(DdpComponent),
     cv.Optional(CONF_PORT, default=4048): cv.port,
+    cv.Optional(CONF_METRICS, default=False): cv.boolean,
 }).extend(cv.COMPONENT_SCHEMA)
 
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
     cg.add(var.set_port(config[CONF_PORT]))
+
+    # Define DDP_METRICS build flag if metrics are enabled
+    if config[CONF_METRICS]:
+        cg.add_build_flag("-DDDP_METRICS")
 
 
 # Register ddp_light_effect as an addressable light effect

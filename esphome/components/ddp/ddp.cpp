@@ -113,37 +113,76 @@ void DdpComponent::loop() {
       double dt_s = (double)dt_us / 1e6;
 
       double push_fps = m.win_frames_push / dt_s;
-      double disp_fps = m.win_frames_dispatched / dt_s;
       double rx_mbps      = (m.win_rx_bytes * 8.0) / (dt_s * 1e6);
       double rx_wire_mbps = (m.win_rx_wire_bytes * 8.0) / (dt_s * 1e6);
-      double cov_pct  = m.coverage_ewma * 100.0;
       double lat_ms   = m.dispatch_lat_us_ewma / 1000.0;
       double pkts_per_wakeup = (m.rx_wakeups > 0)
         ? ((double)m.rx_pkts_in_slices / (double)m.rx_wakeups)
         : 0.0;
 
       // Only log if there was activity in this window
-      if (m.win_frames_push > 0 || m.win_frames_dispatched > 0 || m.win_rx_bytes > 0) {
+      if (m.win_frames_push > 0 || m.win_rx_bytes > 0) {
         had_activity = true;
-        ESP_LOGI(TAG,
-          "id=%u rx_pkts=%llu rx_B=%llu win{push=%.1ffps disp=%.1ffps rx=%.2fMb/s wire=%.2fMb/s pkt_gap=%u} "
-          "tot{push=%u disp=%u} cov(avg)=%.1f%% build(avg)=%.1f ms lat(avg)=%.1f ms intra(max)=%.1f ms "
-          "rx_slc{wakeups=%u pkts/burst=%.2f}",
-          (unsigned)id,
-          (unsigned long long)m.rx_pkts,
-          (unsigned long long)m.rx_bytes,
-          push_fps, disp_fps, rx_mbps, rx_wire_mbps, m.win_pkt_gap,
-          m.frames_push, m.frames_dispatched,
-          cov_pct, m.build_ms_ewma, lat_ms, m.intra_ms_max,
-          m.rx_wakeups, pkts_per_wakeup
-        );
+
+#ifdef DDP_METRICS
+        // Query renderer metrics if available
+        auto renderers_it = renderers_.find(id);
+        const RendererMetrics* r_metrics = nullptr;
+        DdpRenderer* renderer = nullptr;
+        if (renderers_it != renderers_.end() && !renderers_it->second.empty()) {
+          // Use first renderer for this stream (usually only one)
+          renderer = *renderers_it->second.begin();
+          r_metrics = renderer->get_metrics();
+        }
+
+        // Build combined log with protocol + renderer metrics
+        if (r_metrics && renderer) {
+          double render_fps = r_metrics->win_frames_presented / dt_s;
+          double render_cov_pct = r_metrics->coverage_ewma * 100.0;
+          double render_lat_ms = r_metrics->present_lat_us_ewma / 1000.0;
+          double fps_delta = render_fps - push_fps;  // negative = falling behind
+
+          ESP_LOGI(TAG,
+            "id=%u rx_pkts=%llu rx_B=%llu win{push=%.1ffps rx=%.2fMb/s wire=%.2fMb/s pkt_gap=%u} "
+            "tot{push=%u} build(avg)=%.1f ms lat(avg)=%.1f ms intra(max)=%.1f ms "
+            "rx_slc{wakeups=%u pkts/burst=%.2f} "
+            "render{display=%.1ffps Δ%.1f cov=%.1f%% lat=%.1fms queue=%.1fms} tot{present=%u}",
+            (unsigned)id,
+            (unsigned long long)m.rx_pkts,
+            (unsigned long long)m.rx_bytes,
+            push_fps, rx_mbps, rx_wire_mbps, m.win_pkt_gap,
+            m.frames_push,
+            m.build_ms_ewma, lat_ms, m.intra_ms_max,
+            m.rx_wakeups, pkts_per_wakeup,
+            render_fps, fps_delta, render_cov_pct, render_lat_ms, r_metrics->queue_wait_ms_ewma,
+            r_metrics->frames_presented
+          );
+
+          // Reset renderer windowed counters
+          renderer->reset_windowed_metrics();
+        } else
+#endif
+        {
+          // Protocol metrics only (no renderer or metrics disabled)
+          ESP_LOGI(TAG,
+            "id=%u rx_pkts=%llu rx_B=%llu win{push=%.1ffps rx=%.2fMb/s wire=%.2fMb/s pkt_gap=%u} "
+            "tot{push=%u} build(avg)=%.1f ms lat(avg)=%.1f ms intra(max)=%.1f ms "
+            "rx_slc{wakeups=%u pkts/burst=%.2f}",
+            (unsigned)id,
+            (unsigned long long)m.rx_pkts,
+            (unsigned long long)m.rx_bytes,
+            push_fps, rx_mbps, rx_wire_mbps, m.win_pkt_gap,
+            m.frames_push,
+            m.build_ms_ewma, lat_ms, m.intra_ms_max,
+            m.rx_wakeups, pkts_per_wakeup
+          );
+        }
       }
 
       // reset window; keep totals & EWMA
       m.rx_wakeups = 0;
       m.rx_pkts_in_slices = 0;
       m.win_frames_push = 0;
-      m.win_frames_dispatched = 0;
       m.win_rx_bytes = 0;
       m.win_rx_wire_bytes = 0;
       m.win_pkt_gap = 0;
@@ -405,8 +444,7 @@ void DdpComponent::handle_packet_(const uint8_t *raw, size_t n) {
     uint8_t delta = (uint8_t)((cur_pkt - prev) & 0x0F);
     if (delta > 1) {
       uint32_t add = (uint32_t)(delta - 1);
-      m.pkt_seq_gaps += add;
-      m.win_pkt_gap  += add;
+      m.win_pkt_gap += add;
     }
   }
   m.last_seq_pkt = cur_pkt;
@@ -436,8 +474,6 @@ void DdpComponent::handle_push_(uint8_t stream_id, const DdpHeader* hdr) {
   auto& m = metrics_[stream_id];
   m.frames_push += 1;
   m.win_frames_push += 1;
-  m.frames_dispatched += 1;
-  m.win_frames_dispatched += 1;
 
   // Build time (first packet -> PUSH)
   if (m.frame_first_pkt_us) {
