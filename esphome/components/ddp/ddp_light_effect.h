@@ -4,6 +4,7 @@
 #pragma once
 
 #include "esphome/core/component.h"
+#include "esphome/core/helpers.h"
 #include "esphome/components/light/addressable_light_effect.h"
 #include "ddp.h"
 #include "ddp_renderer.h"
@@ -47,6 +48,9 @@ class DdpLightEffect : public light::AddressableLightEffect, public DdpRenderer 
   uint8_t* frame_buffer_{nullptr};  // RGBW frame buffer
   size_t frame_pixels_{0};          // Expected pixel count (width * height)
   std::atomic<bool> frame_ready_{false};  // True when frame is ready to apply()
+
+  // Allocator for frame buffer (tries PSRAM first, falls back to internal RAM)
+  RAMAllocator<uint8_t> allocator_;
 };
 
 }  // namespace ddp

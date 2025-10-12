@@ -23,9 +23,7 @@ void DdpLightEffect::on_data(size_t offset_px, const uint8_t* pixels,
 
   // Allocate buffer if not yet initialized
   if (!frame_buffer_ && frame_pixels_ > 0) {
-    // Use ExternalRAMAllocator for PSRAM support (16KB+ for typical streams)
-    ExternalRAMAllocator<uint8_t> allocator(ExternalRAMAllocator<uint8_t>::ALLOW_FAILURE);
-    frame_buffer_ = allocator.allocate(frame_pixels_ * 4);  // RGBW
+    frame_buffer_ = allocator_.allocate(frame_pixels_ * 4);  // RGBW
     if (!frame_buffer_) {
       ESP_LOGE(TAG, "Failed to allocate frame buffer (%zu bytes)", frame_pixels_ * 4);
       return;
@@ -148,8 +146,7 @@ void DdpLightEffect::stop() {
 
   // Free frame buffer (RGBW = 4 bytes per pixel)
   if (frame_buffer_) {
-    ExternalRAMAllocator<uint8_t> allocator(ExternalRAMAllocator<uint8_t>::ALLOW_FAILURE);
-    allocator.deallocate(frame_buffer_, frame_pixels_ * 4);
+    allocator_.deallocate(frame_buffer_, frame_pixels_ * 4);
     frame_buffer_ = nullptr;
   }
 
