@@ -42,9 +42,9 @@ class DdpLightEffect : public light::AddressableLightEffect, public DdpRenderer 
   uint8_t stream_id_{0};
   int width_{-1}, height_{-1};  // LED strip layout
 
-  // Frame buffer - RGB888 format (owned by effect, heap-allocated)
-  // Large allocation (e.g., 64x64x3 = 12KB), so allocated in setup() for PSRAM if available
-  uint8_t* frame_buffer_{nullptr};  // RGB888 frame buffer
+  // Frame buffer - RGBW format (owned by effect, heap-allocated)
+  // Large allocation (e.g., 64x64x4 = 16KB), so allocated in setup() for PSRAM if available
+  uint8_t* frame_buffer_{nullptr};  // RGBW frame buffer
   size_t frame_pixels_{0};          // Expected pixel count (width * height)
   std::atomic<bool> frame_ready_{false};  // True when frame is ready to apply()
 };

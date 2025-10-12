@@ -109,5 +109,59 @@ inline void convert_rgb888_to_rgb32(uint32_t* dst, const uint8_t* src,
   }
 }
 
+// Convert RGBW to RGB565 (drop W channel) with optional byte swap
+// Safe to call from UDP task (pure math, no allocations or API calls)
+// Inline so it can be used across components without linkage issues
+//
+// dst: Destination buffer for RGB565 pixels (must be pre-allocated)
+// src: Source RGBW data (4 bytes per pixel: R, G, B, W)
+// pixel_count: Number of pixels to convert
+// swap_bytes: If true, swap byte order (for LV_COLOR_16_SWAP compatibility)
+inline void convert_rgbw_to_rgb565(uint16_t* dst, const uint8_t* src,
+                                    size_t pixel_count, bool swap_bytes) {
+  if (!dst || !src) return;
+
+  const uint8_t* sp = src;
+
+  if (swap_bytes) {
+    // Convert and swap bytes for LV_COLOR_16_SWAP
+    for (size_t i = 0; i < pixel_count; ++i) {
+      uint16_t c = LUT_R5[sp[0]] | LUT_G6[sp[1]] | LUT_B5[sp[2]];
+      dst[i] = (uint16_t)((c >> 8) | (c << 8));  // Swap bytes
+      sp += 4;  // Skip W channel
+    }
+  } else {
+    // Convert without swap
+    for (size_t i = 0; i < pixel_count; ++i) {
+      dst[i] = (uint16_t)(LUT_R5[sp[0]] | LUT_G6[sp[1]] | LUT_B5[sp[2]]);
+      sp += 4;  // Skip W channel
+    }
+  }
+}
+
+// Convert RGBW to RGB32 (drop W channel, use 0xFF for alpha)
+// Safe to call from UDP task (pure math, no allocations or API calls)
+// Inline so it can be used across components without linkage issues
+//
+// dst: Destination buffer for RGB32 pixels (must be pre-allocated)
+// src: Source RGBW data (4 bytes per pixel: R, G, B, W)
+// pixel_count: Number of pixels to convert
+inline void convert_rgbw_to_rgb32(uint32_t* dst, const uint8_t* src,
+                                   size_t pixel_count) {
+  if (!dst || !src) return;
+
+  const uint8_t* sp = src;
+
+  for (size_t i = 0; i < pixel_count; ++i) {
+    // LVGL RGB32 format: R, G, B, A (alpha = 0xFF, W ignored)
+    uint32_t c = ((uint32_t)sp[0]) |           // Red
+                 ((uint32_t)sp[1] << 8) |      // Green
+                 ((uint32_t)sp[2] << 16) |     // Blue
+                 0xFF000000;                   // Alpha (sp[3] = W ignored)
+    dst[i] = c;
+    sp += 4;
+  }
+}
+
 }  // namespace ddp
 }  // namespace esphome

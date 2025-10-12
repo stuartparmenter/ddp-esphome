@@ -42,11 +42,6 @@ void DdpCanvas::on_data(size_t offset_px, const uint8_t* pixels,
                         PixelFormat format, size_t pixel_count) {
   // UDP TASK CONTEXT - no LVGL or ESPHome APIs allowed!
 
-  // Reject RGBW format (LVGL doesn't support it)
-  if (format == PixelFormat::RGBW) {
-    return;
-  }
-
   // Check if canvas is bound
   if (!bound_ || buf_px_ == 0) {
     return;
@@ -76,6 +71,8 @@ void DdpCanvas::on_data(size_t offset_px, const uint8_t* pixels,
     bytes = pixel_count * 3;
   } else if (format == PixelFormat::RGB565_BE || format == PixelFormat::RGB565_LE) {
     bytes = pixel_count * 2;
+  } else if (format == PixelFormat::RGBW) {
+    bytes = pixel_count * 4;
   }
   frame_bytes_accum_.fetch_add(bytes, std::memory_order_relaxed);
 #endif
@@ -96,25 +93,23 @@ void DdpCanvas::on_data(size_t offset_px, const uint8_t* pixels,
 #if LV_COLOR_DEPTH == 16
   uint16_t* dst = dst_buf + offset_px;
 
+  // Determine byte swap requirement once (used by RGB888 and RGBW conversions)
+  constexpr bool swap_bytes =
+  #if defined(LV_COLOR_16_SWAP) && LV_COLOR_16_SWAP
+      true;
+  #else
+      false;
+  #endif
+
   if (format == PixelFormat::RGB888) {
     // RGB888 → RGB565 (with optional byte swap)
-    #if defined(LV_COLOR_16_SWAP) && LV_COLOR_16_SWAP
-      convert_rgb888_to_rgb565(dst, pixels, pixel_count, true);
-    #else
-      convert_rgb888_to_rgb565(dst, pixels, pixel_count, false);
-    #endif
+    convert_rgb888_to_rgb565(dst, pixels, pixel_count, swap_bytes);
 
   } else if (format == PixelFormat::RGB565_BE || format == PixelFormat::RGB565_LE) {
     // RGB565 → RGB565 (byte swap if endianness mismatch)
     const bool src_be = (format == PixelFormat::RGB565_BE);
-    const bool want_be =
-    #if defined(LV_COLOR_16_SWAP) && LV_COLOR_16_SWAP
-        true;
-    #else
-        false;
-    #endif
 
-    if (src_be == want_be) {
+    if (src_be == swap_bytes) {
       // Direct copy
       std::memcpy(dst, pixels, pixel_count * 2);
     } else {
@@ -122,6 +117,10 @@ void DdpCanvas::on_data(size_t offset_px, const uint8_t* pixels,
       std::memcpy(dst, pixels, pixel_count * 2);
       swap_rgb565_bytes(dst, pixel_count);
     }
+
+  } else if (format == PixelFormat::RGBW) {
+    // RGBW → RGB565 (drop W channel, with optional byte swap)
+    convert_rgbw_to_rgb565(dst, pixels, pixel_count, swap_bytes);
   }
 
 #elif LV_COLOR_DEPTH == 32
@@ -150,6 +149,10 @@ void DdpCanvas::on_data(size_t offset_px, const uint8_t* pixels,
       dst32[i] = c;
       sp += 2;
     }
+
+  } else if (format == PixelFormat::RGBW) {
+    // RGBW → RGB32 (drop W channel, use 0xFF for alpha)
+    convert_rgbw_to_rgb32(dst32, pixels, pixel_count);
   }
 #endif
 }

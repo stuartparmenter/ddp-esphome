@@ -23,14 +23,14 @@ void DdpLightEffect::on_data(size_t offset_px, const uint8_t* pixels,
 
   // Allocate buffer if not yet initialized
   if (!frame_buffer_ && frame_pixels_ > 0) {
-    // Use ExternalRAMAllocator for PSRAM support (12KB+ for typical streams)
+    // Use ExternalRAMAllocator for PSRAM support (16KB+ for typical streams)
     ExternalRAMAllocator<uint8_t> allocator(ExternalRAMAllocator<uint8_t>::ALLOW_FAILURE);
-    frame_buffer_ = allocator.allocate(frame_pixels_ * 3);  // RGB888
+    frame_buffer_ = allocator.allocate(frame_pixels_ * 4);  // RGBW
     if (!frame_buffer_) {
-      ESP_LOGE(TAG, "Failed to allocate frame buffer (%zu bytes)", frame_pixels_ * 3);
+      ESP_LOGE(TAG, "Failed to allocate frame buffer (%zu bytes)", frame_pixels_ * 4);
       return;
     }
-    std::memset(frame_buffer_, 0, frame_pixels_ * 3);
+    std::memset(frame_buffer_, 0, frame_pixels_ * 4);
   }
 
   if (!frame_buffer_ || frame_pixels_ == 0) return;
@@ -40,15 +40,29 @@ void DdpLightEffect::on_data(size_t offset_px, const uint8_t* pixels,
     return;  // Silently drop out-of-bounds data
   }
 
-  uint8_t* dst_rgb888 = frame_buffer_ + (offset_px * 3);
+  uint8_t* dst_rgbw = frame_buffer_ + (offset_px * 4);
 
-  // Convert and write pixels to RGB888 buffer using shared helpers
-  if (format == PixelFormat::RGB888) {
-    // Direct copy
-    std::memcpy(dst_rgb888, pixels, pixel_count * 3);
+  // Convert all formats to RGBW on arrival (single conversion)
+  if (format == PixelFormat::RGBW) {
+    // Direct copy - already RGBW
+    std::memcpy(dst_rgbw, pixels, pixel_count * 4);
+
+  } else if (format == PixelFormat::RGB888) {
+    // RGB888 → RGBW (calculate white from RGB average)
+    const uint8_t* sp = pixels;
+    for (size_t i = 0; i < pixel_count; ++i) {
+      uint8_t r = sp[0];
+      uint8_t g = sp[1];
+      uint8_t b = sp[2];
+      dst_rgbw[i * 4 + 0] = r;
+      dst_rgbw[i * 4 + 1] = g;
+      dst_rgbw[i * 4 + 2] = b;
+      dst_rgbw[i * 4 + 3] = (r + g + b) / 3;  // W = average
+      sp += 3;
+    }
 
   } else if (format == PixelFormat::RGB565_BE || format == PixelFormat::RGB565_LE) {
-    // RGB565 → RGB888 (manual expansion, shared helper only does RGB888→RGB565)
+    // RGB565 → RGBW (expand to RGB888, then calculate white)
     const bool src_be = (format == PixelFormat::RGB565_BE);
     const uint8_t* sp = pixels;
 
@@ -59,20 +73,15 @@ void DdpLightEffect::on_data(size_t offset_px, const uint8_t* pixels,
       uint8_t g6 = (uint8_t)((v >> 5)  & 0x3F);
       uint8_t b5 = (uint8_t)( v        & 0x1F);
 
-      dst_rgb888[i * 3 + 0] = (uint8_t)((r5 << 3) | (r5 >> 2));  // R
-      dst_rgb888[i * 3 + 1] = (uint8_t)((g6 << 2) | (g6 >> 4));  // G
-      dst_rgb888[i * 3 + 2] = (uint8_t)((b5 << 3) | (b5 >> 2));  // B
-      sp += 2;
-    }
+      uint8_t r = (uint8_t)((r5 << 3) | (r5 >> 2));
+      uint8_t g = (uint8_t)((g6 << 2) | (g6 >> 4));
+      uint8_t b = (uint8_t)((b5 << 3) | (b5 >> 2));
 
-  } else if (format == PixelFormat::RGBW) {
-    // RGBW → RGB888 (drop white channel)
-    const uint8_t* sp = pixels;
-    for (size_t i = 0; i < pixel_count; ++i) {
-      dst_rgb888[i * 3 + 0] = sp[0];  // R
-      dst_rgb888[i * 3 + 1] = sp[1];  // G
-      dst_rgb888[i * 3 + 2] = sp[2];  // B
-      sp += 4;  // Skip W
+      dst_rgbw[i * 4 + 0] = r;
+      dst_rgbw[i * 4 + 1] = g;
+      dst_rgbw[i * 4 + 2] = b;
+      dst_rgbw[i * 4 + 3] = (r + g + b) / 3;  // W = average
+      sp += 2;
     }
   }
 }
@@ -137,10 +146,10 @@ void DdpLightEffect::stop() {
   // Note: We don't unregister since registration is permanent (happens at codegen time)
   ESP_LOGI(TAG, "Stopped DDP light effect '%s' for stream %u", name_.c_str(), stream_id_);
 
-  // Free frame buffer
+  // Free frame buffer (RGBW = 4 bytes per pixel)
   if (frame_buffer_) {
     ExternalRAMAllocator<uint8_t> allocator(ExternalRAMAllocator<uint8_t>::ALLOW_FAILURE);
-    allocator.deallocate(frame_buffer_, frame_pixels_ * 3);
+    allocator.deallocate(frame_buffer_, frame_pixels_ * 4);
     frame_buffer_ = nullptr;
   }
 
@@ -163,15 +172,13 @@ void DdpLightEffect::apply(light::AddressableLight& it, const Color& current_col
   // Limit to available LEDs
   size_t leds_to_set = std::min((size_t)num_leds, frame_pixels_);
 
-  // Apply RGB888 pixels (buffer is always RGB888 after on_data conversion)
+  // Apply RGBW pixels directly (buffer is always RGBW after on_data conversion)
   const uint8_t* data = frame_buffer_;
   for (size_t i = 0; i < leds_to_set; i++) {
-    uint8_t r = data[i * 3 + 0];
-    uint8_t g = data[i * 3 + 1];
-    uint8_t b = data[i * 3 + 2];
-    // Calculate white channel as average (for RGBW LEDs in RGB mode)
-    uint8_t w = (r + g + b) / 3;
-    it[i] = Color(r, g, b, w);
+    it[i] = Color(data[i * 4 + 0],  // R
+                  data[i * 4 + 1],  // G
+                  data[i * 4 + 2],  // B
+                  data[i * 4 + 3]); // W
   }
 
   // Schedule LED update
