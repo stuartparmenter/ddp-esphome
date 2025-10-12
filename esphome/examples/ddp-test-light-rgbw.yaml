@@ -44,5 +44,3 @@ light:
           name: "DDP RGBW Stream"
           ddp_id: ddp_server
           stream: 1
-          width: 10
-          height: 10

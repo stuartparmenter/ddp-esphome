@@ -90,33 +90,12 @@ void DdpLightEffect::on_push() {
 }
 
 bool DdpLightEffect::get_dimensions(int* w, int* h) const {
-  // Return configured dimensions if set
-  if (width_ > 0 && height_ > 0) {
-    if (w) *w = width_;
-    if (h) *h = height_;
-    return true;
-  }
-
-  // Try to derive from LED count
+  // LED strips are 1D: report as num_leds × 1
   auto* it = get_addressable_();
   if (it) {
-    int num_leds = it->size();
-    if (width_ > 0) {
-      // Width specified, calculate height
-      if (w) *w = width_;
-      if (h) *h = (num_leds + width_ - 1) / width_;
-      return true;
-    } else if (height_ > 0) {
-      // Height specified, calculate width
-      if (w) *w = (num_leds + height_ - 1) / height_;
-      if (h) *h = height_;
-      return true;
-    } else {
-      // No dimensions specified, default to linear (num_leds × 1)
-      if (w) *w = num_leds;
-      if (h) *h = 1;
-      return true;
-    }
+    if (w) *w = it->size();
+    if (h) *h = 1;
+    return true;
   }
 
   return false;
@@ -130,14 +109,14 @@ void DdpLightEffect::start() {
   // Note: Renderer registration happens at codegen time (in Python __init__.py)
   // so that DdpComponent::setup() has complete renderer info for mDNS
 
-  // Calculate frame buffer size
-  int w = 0, h = 0;
-  if (get_dimensions(&w, &h) && w > 0 && h > 0) {
-    frame_pixels_ = (size_t)w * h;
+  // Calculate frame buffer size from LED count
+  int num_leds = 0;
+  if (get_dimensions(&num_leds, nullptr)) {
+    frame_pixels_ = (size_t)num_leds;
   }
 
-  ESP_LOGI(TAG, "Started DDP light effect '%s' for stream %u (%dx%d = %zu px)",
-           name_.c_str(), stream_id_, w, h, frame_pixels_);
+  ESP_LOGI(TAG, "Started DDP light effect '%s' for stream %u (%d LEDs)",
+           name_.c_str(), stream_id_, num_leds);
 }
 
 void DdpLightEffect::stop() {

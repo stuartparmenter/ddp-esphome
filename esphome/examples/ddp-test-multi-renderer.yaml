@@ -54,8 +54,6 @@ light:
           name: "DDP Mirror"
           ddp_id: ddp_server
           stream: 1          # Same stream 1!
-          width: 8
-          height: 8
 
 # LVGL setup
 lvgl:

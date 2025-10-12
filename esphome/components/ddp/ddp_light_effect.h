@@ -23,7 +23,6 @@ class DdpLightEffect : public light::AddressableLightEffect, public DdpRenderer 
   // Configuration
   void set_parent(DdpComponent* parent) { parent_ = parent; }
   void set_stream_id(uint8_t id) { stream_id_ = id; }
-  void set_dimensions(int w, int h) { width_ = w; height_ = h; }
 
   // DdpRenderer interface (UDP TASK CONTEXT)
   void on_data(size_t offset_px, const uint8_t* pixels,
@@ -41,12 +40,11 @@ class DdpLightEffect : public light::AddressableLightEffect, public DdpRenderer 
  protected:
   DdpComponent* parent_{nullptr};
   uint8_t stream_id_{0};
-  int width_{-1}, height_{-1};  // LED strip layout
 
   // Frame buffer - RGBW format (owned by effect, heap-allocated)
-  // Large allocation (e.g., 64x64x4 = 16KB), so allocated in setup() for PSRAM if available
+  // Large allocation (e.g., 256x4 = 1KB typical), so allocated lazily for PSRAM if available
   uint8_t* frame_buffer_{nullptr};  // RGBW frame buffer
-  size_t frame_pixels_{0};          // Expected pixel count (width * height)
+  size_t frame_pixels_{0};          // Expected pixel count (num_leds)
   std::atomic<bool> frame_ready_{false};  // True when frame is ready to apply()
 
   // Allocator for frame buffer (tries PSRAM first, falls back to internal RAM)

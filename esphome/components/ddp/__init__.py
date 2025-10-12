@@ -71,8 +71,6 @@ async def to_code(config):
     {
         cv.GenerateID(CONF_DDP_ID): cv.use_id(DdpComponent),
         cv.Optional(CONF_STREAM): cv.int_range(min=1, max=249),  # Optional - auto-generates if not specified
-        cv.Optional("width", default=-1): cv.int_,
-        cv.Optional("height", default=-1): cv.int_,
     },
 )
 async def ddp_light_effect_to_code(config, effect_id):
@@ -89,7 +87,6 @@ async def ddp_light_effect_to_code(config, effect_id):
     effect = cg.new_Pvariable(effect_id, config[CONF_NAME])
     cg.add(effect.set_parent(parent))
     cg.add(effect.set_stream_id(stream_id))
-    cg.add(effect.set_dimensions(config.get("width", -1), config.get("height", -1)))
 
     # Register with parent DDP component
     cg.add(parent.register_renderer(effect))
