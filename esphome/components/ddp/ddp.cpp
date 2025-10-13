@@ -425,16 +425,33 @@ void DdpComponent::handle_packet_(const uint8_t *raw, size_t n) {
   }
 #endif
 
-  // Handle payload by format - accumulate into buffer
-  if (cfg == DDP_PIXCFG_RGB888 || cfg == DDP_PIXCFG_RGB_LEGACY) {
-    handle_rgb888_(stream_id, h, p, len);
-  } else if (cfg == DDP_PIXCFG_RGB565_LE || cfg == DDP_PIXCFG_RGB565_BE) {
-    handle_rgb565_(stream_id, h, p, len);
-  } else if (cfg == DDP_PIXCFG_RGBW) {
-    handle_rgbw_(stream_id, h, p, len);
-  } else {
-    return; // unknown cfg; ignore
+  // Handle payload by format
+  size_t bytes_per_pixel;
+  PixelFormat format;
+
+  switch (cfg) {
+    case DDP_PIXCFG_RGB888:
+    case DDP_PIXCFG_RGB_LEGACY:
+      bytes_per_pixel = 3;
+      format = PixelFormat::RGB888;
+      break;
+    case DDP_PIXCFG_RGB565_LE:
+      bytes_per_pixel = 2;
+      format = PixelFormat::RGB565_LE;
+      break;
+    case DDP_PIXCFG_RGB565_BE:
+      bytes_per_pixel = 2;
+      format = PixelFormat::RGB565_BE;
+      break;
+    case DDP_PIXCFG_RGBW:
+      bytes_per_pixel = 4;
+      format = PixelFormat::RGBW;
+      break;
+    default:
+      return; // unknown format; ignore (skip metrics for invalid packets)
   }
+
+  handle_pixel_data_(stream_id, h, p, len, bytes_per_pixel, format);
 
 #if DDP_METRICS
   // Per-packet sequencing (gap detection)
@@ -508,44 +525,15 @@ void DdpComponent::handle_push_(uint8_t stream_id, const DdpHeader* hdr) {
 #endif
 }
 
-// RGB888 - stream directly to renderers (UDP TASK CONTEXT)
-void DdpComponent::handle_rgb888_(uint8_t stream_id, const DdpHeader* hdr,
-                                  const uint8_t* p, size_t len) {
+// Generic pixel data handler - all formats (UDP TASK CONTEXT)
+void DdpComponent::handle_pixel_data_(uint8_t stream_id, const DdpHeader* hdr,
+                                      const uint8_t* p, size_t len,
+                                      size_t bytes_per_pixel, PixelFormat format) {
   // Validate alignment
-  if ((ntohl(hdr->offset_be) % 3) != 0 || (len % 3) != 0) return;
+  if ((ntohl(hdr->offset_be) % bytes_per_pixel) != 0 || (len % bytes_per_pixel) != 0) return;
 
-  size_t pixel_offset = ntohl(hdr->offset_be) / 3;
-  size_t pixel_count = len / 3;
-
-  // Dispatch to all renderers for this stream (streaming!)
-  auto* renderers = find_renderers_(stream_id);
-  if (!renderers) return;
-
-  for (auto* renderer : *renderers) {
-    // Call renderer from UDP task - writes to pre-allocated buffers
-    renderer->on_data(pixel_offset, p, PixelFormat::RGB888, pixel_count);
-  }
-
-#if DDP_METRICS
-  auto& m = metrics_[stream_id];
-  m.frame_bytes_accum += len;
-  m.frame_px_accum += pixel_count;
-#endif
-}
-
-// RGB565 - stream directly to renderers (UDP TASK CONTEXT)
-void DdpComponent::handle_rgb565_(uint8_t stream_id, const DdpHeader* hdr,
-                                  const uint8_t* p, size_t len) {
-  // Validate alignment
-  if ((ntohl(hdr->offset_be) % 2) != 0 || (len % 2) != 0) return;
-
-  size_t pixel_offset = ntohl(hdr->offset_be) / 2;
-  size_t pixel_count = len / 2;
-
-  // Determine format from pixcfg
-  PixelFormat format = (hdr->pixcfg == DDP_PIXCFG_RGB565_BE)
-    ? PixelFormat::RGB565_BE
-    : PixelFormat::RGB565_LE;
+  size_t pixel_offset = ntohl(hdr->offset_be) / bytes_per_pixel;
+  size_t pixel_count = len / bytes_per_pixel;
 
   // Dispatch to all renderers for this stream (streaming!)
   auto* renderers = find_renderers_(stream_id);
@@ -554,31 +542,6 @@ void DdpComponent::handle_rgb565_(uint8_t stream_id, const DdpHeader* hdr,
   for (auto* renderer : *renderers) {
     // Call renderer from UDP task - writes to pre-allocated buffers
     renderer->on_data(pixel_offset, p, format, pixel_count);
-  }
-
-#if DDP_METRICS
-  auto& m = metrics_[stream_id];
-  m.frame_bytes_accum += len;
-  m.frame_px_accum += pixel_count;
-#endif
-}
-
-// RGBW - stream directly to renderers (UDP TASK CONTEXT)
-void DdpComponent::handle_rgbw_(uint8_t stream_id, const DdpHeader* hdr,
-                                const uint8_t* p, size_t len) {
-  // Validate alignment
-  if ((ntohl(hdr->offset_be) % 4) != 0 || (len % 4) != 0) return;
-
-  size_t pixel_offset = ntohl(hdr->offset_be) / 4;
-  size_t pixel_count = len / 4;
-
-  // Dispatch to all renderers for this stream (streaming!)
-  auto* renderers = find_renderers_(stream_id);
-  if (!renderers) return;
-
-  for (auto* renderer : *renderers) {
-    // Call renderer from UDP task - writes to pre-allocated buffers
-    renderer->on_data(pixel_offset, p, PixelFormat::RGBW, pixel_count);
   }
 
 #if DDP_METRICS

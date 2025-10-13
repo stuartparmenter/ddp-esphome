@@ -89,9 +89,9 @@ class DdpComponent : public Component {
   // Packet handling - dispatches to registered renderers
   void handle_packet_(const uint8_t* buf, size_t len);
   void handle_push_(uint8_t stream_id, const DdpHeader* hdr);
-  void handle_rgb888_(uint8_t stream_id, const DdpHeader* hdr, const uint8_t* payload, size_t len);
-  void handle_rgb565_(uint8_t stream_id, const DdpHeader* hdr, const uint8_t* payload, size_t len);
-  void handle_rgbw_(uint8_t stream_id, const DdpHeader* hdr, const uint8_t* payload, size_t len);
+  void handle_pixel_data_(uint8_t stream_id, const DdpHeader* hdr,
+                          const uint8_t* payload, size_t len,
+                          size_t bytes_per_pixel, PixelFormat format);
 
   // Helper to find renderers for a stream
   std::set<DdpRenderer*>* find_renderers_(uint8_t stream_id);
