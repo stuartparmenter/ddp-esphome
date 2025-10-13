@@ -166,14 +166,18 @@ static void log_stream_line_(const char *label,
                              const std::optional<bool> &loop,
                              const std::optional<std::string> &hw,
                              const std::optional<std::string> &fit) {
+  std::string pace_str = pace ? std::to_string(*pace) : "(unset)";
+  std::string ema_str = ema ? std::to_string(*ema) : "(unset)";
+  std::string expand_str = expand ? std::to_string(*expand) : "(unset)";
+
   ESP_LOGI(TAG, "tx %s stream=%u size=%dx%d src=%s ddp_port=%u fmt=%s pixcfg=0x%02X "
                 "pace=%s ema=%s expand=%s loop=%s hw=%s fit=%s",
            label,
            (unsigned) stream_id, w, h, src.c_str(), (unsigned) ddp_port,
            (fmt?fmt->c_str():"(unset)"), (unsigned) (pixcfg?*pixcfg:0),
-           (pace?std::to_string(*pace).c_str():"(unset)"),
-           (ema?std::to_string(*ema).c_str():"(unset)"),
-           (expand?std::to_string(*expand).c_str():"(unset)"),
+           pace_str.c_str(),
+           ema_str.c_str(),
+           expand_str.c_str(),
            (loop?(*loop?"true":"false"):"(unset)"),
            (hw?hw->c_str():"(unset)"),
            (fit?fit->c_str():"(unset)"));
@@ -298,19 +302,18 @@ void MediaProxyControl::dump_config() {
     resolve_size_(id, &w, &h);
     ESP_LOGCONFIG(TAG, "  - stream=%u size=%dx%d", (unsigned) id, w, h);
 
-    auto str_or = [](const std::optional<std::string> &v){ return v ? v->c_str() : "(unset)"; };
-    auto int_or = [](const std::optional<int> &v){ return v ? std::to_string(*v).c_str() : "(unset)"; };
-    auto flt_or = [](const std::optional<float> &v){ return v ? std::to_string(*v).c_str() : "(unset)"; };
-    auto boo_or = [](const std::optional<bool> &v){ return v ? (*v ? "true" : "false") : "(unset)"; };
+    std::string pace_str = output->pace_ ? std::to_string(*output->pace_) : "(unset)";
+    std::string ema_str = output->ema_ ? std::to_string(*output->ema_) : "(unset)";
+    std::string expand_str = output->expand_ ? std::to_string(*output->expand_) : "(unset)";
 
     ESP_LOGCONFIG(TAG, "      src=%s pace=%s ema=%s expand=%s loop=%s hw=%s format=%s",
                   output->src_.c_str(),
-                  int_or(output->pace_),
-                  flt_or(output->ema_),
-                  int_or(output->expand_),
-                  boo_or(output->loop_),
-                  str_or(output->hw_),
-                  str_or(output->format_));
+                  pace_str.c_str(),
+                  ema_str.c_str(),
+                  expand_str.c_str(),
+                  output->loop_ ? (*output->loop_ ? "true" : "false") : "(unset)",
+                  output->hw_ ? output->hw_->c_str() : "(unset)",
+                  output->format_ ? output->format_->c_str() : "(unset)");
   }
 }
 
