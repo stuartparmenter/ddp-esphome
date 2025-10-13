@@ -40,47 +40,22 @@ void DdpLightEffect::on_data(size_t offset_px, const uint8_t* pixels,
 
   uint8_t* dst_rgbw = frame_buffer_ + (offset_px * 4);
 
+  // Determine RGBW conversion mode based on strip capability
+  RGBWMode mode = supports_white_ ? RGBWMode::ACCURATE : RGBWMode::NONE;
+
   // Convert all formats to RGBW on arrival (single conversion)
   if (format == PixelFormat::RGBW) {
     // Direct copy - already RGBW
     std::memcpy(dst_rgbw, pixels, pixel_count * 4);
 
   } else if (format == PixelFormat::RGB888) {
-    // RGB888 → RGBW (calculate white from RGB average)
-    const uint8_t* sp = pixels;
-    for (size_t i = 0; i < pixel_count; ++i) {
-      uint8_t r = sp[0];
-      uint8_t g = sp[1];
-      uint8_t b = sp[2];
-      dst_rgbw[i * 4 + 0] = r;
-      dst_rgbw[i * 4 + 1] = g;
-      dst_rgbw[i * 4 + 2] = b;
-      dst_rgbw[i * 4 + 3] = (r + g + b) / 3;  // W = average
-      sp += 3;
-    }
+    // RGB888 → RGBW (mode-based: ACCURATE for RGBW strips, NONE for RGB strips)
+    convert_rgb888_to_rgbw(dst_rgbw, pixels, pixel_count, mode);
 
   } else if (format == PixelFormat::RGB565_BE || format == PixelFormat::RGB565_LE) {
-    // RGB565 → RGBW (expand to RGB888, then calculate white)
-    const bool src_be = (format == PixelFormat::RGB565_BE);
-    const uint8_t* sp = pixels;
-
-    for (size_t i = 0; i < pixel_count; ++i) {
-      uint16_t v = src_be ? (uint16_t)((sp[0] << 8) | sp[1])
-                          : (uint16_t)((sp[1] << 8) | sp[0]);
-      uint8_t r5 = (uint8_t)((v >> 11) & 0x1F);
-      uint8_t g6 = (uint8_t)((v >> 5)  & 0x3F);
-      uint8_t b5 = (uint8_t)( v        & 0x1F);
-
-      uint8_t r = (uint8_t)((r5 << 3) | (r5 >> 2));
-      uint8_t g = (uint8_t)((g6 << 2) | (g6 >> 4));
-      uint8_t b = (uint8_t)((b5 << 3) | (b5 >> 2));
-
-      dst_rgbw[i * 4 + 0] = r;
-      dst_rgbw[i * 4 + 1] = g;
-      dst_rgbw[i * 4 + 2] = b;
-      dst_rgbw[i * 4 + 3] = (r + g + b) / 3;  // W = average
-      sp += 2;
-    }
+    // RGB565 → RGBW (mode-based: ACCURATE for RGBW strips, NONE for RGB strips)
+    const bool src_big_endian = (format == PixelFormat::RGB565_BE);
+    convert_rgb565_to_rgbw(dst_rgbw, pixels, pixel_count, src_big_endian, mode);
   }
 }
 
@@ -115,8 +90,17 @@ void DdpLightEffect::start() {
     frame_pixels_ = (size_t)num_leds;
   }
 
-  ESP_LOGI(TAG, "Started DDP light effect '%s' for stream %u (%d LEDs)",
-           name_.c_str(), stream_id_, num_leds);
+  // Detect strip capability for white channel
+  auto *it = get_addressable_();
+  if (it) {
+    auto traits = it->get_traits();
+    supports_white_ = traits.supports_color_mode(light::ColorMode::RGB_WHITE);
+    ESP_LOGI(TAG, "Started DDP light effect '%s' for stream %u (%d LEDs, %s strip)",
+             name_.c_str(), stream_id_, num_leds, supports_white_ ? "RGBW" : "RGB");
+  } else {
+    ESP_LOGI(TAG, "Started DDP light effect '%s' for stream %u (%d LEDs)",
+             name_.c_str(), stream_id_, num_leds);
+  }
 }
 
 void DdpLightEffect::stop() {

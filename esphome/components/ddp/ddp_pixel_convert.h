@@ -13,6 +13,12 @@
 namespace esphome {
 namespace ddp {
 
+// RGB to RGBW white channel conversion modes (internal use only)
+enum class RGBWMode : uint8_t {
+  NONE = 0,      // RGB only, W=0 (for RGB strips)
+  ACCURATE = 1,  // Extract white, reduce RGB (for RGBW strips)
+};
+
 // RGB565 conversion lookup tables (precomputed inline constexpr arrays)
 // Used for fast RGB888 → RGB565 conversion
 // These are fully declared in the header so any component can include them
@@ -160,6 +166,107 @@ inline void convert_rgbw_to_rgb32(uint32_t* dst, const uint8_t* src,
                  0xFF000000;                   // Alpha (sp[3] = W ignored)
     dst[i] = c;
     sp += 4;
+  }
+}
+
+// Convert RGB888 to RGBW with configurable white channel mode
+// Safe to call from UDP task (pure math, no allocations or API calls)
+// Inline so it can be used across components without linkage issues
+//
+// Modes:
+// - NONE: RGB passthrough, W=0 (for RGB-only strips)
+// - ACCURATE: Extract white and reduce RGB (for RGBW strips, accurate color)
+//   - Pure colors stay pure: (255,0,0) → R=255, G=0, B=0, W=0
+//   - White is efficient: (255,255,255) → R=0, G=0, B=0, W=255
+//   - Mixed colors accurate: (255,200,200) → R=55, G=0, B=0, W=200 (pink = red + white)
+//
+// dst: Destination buffer for RGBW pixels (must be pre-allocated, 4 bytes per pixel)
+// src: Source RGB888 data (3 bytes per pixel: R, G, B)
+// pixel_count: Number of pixels to convert
+// mode: White channel conversion mode
+inline void convert_rgb888_to_rgbw(uint8_t* dst, const uint8_t* src,
+                                    size_t pixel_count, RGBWMode mode) {
+  if (!dst || !src) return;
+
+  const uint8_t* sp = src;
+
+  if (mode == RGBWMode::ACCURATE) {
+    // Extract white and reduce RGB (accurate color)
+    for (size_t i = 0; i < pixel_count; ++i) {
+      uint8_t r = sp[0];
+      uint8_t g = sp[1];
+      uint8_t b = sp[2];
+
+      // Extract common white component (minimum of RGB)
+      uint8_t w = r < g ? (r < b ? r : b) : (g < b ? g : b);
+
+      // Store chromatic residuals + white
+      dst[i * 4 + 0] = r - w;  // R residual (chromatic)
+      dst[i * 4 + 1] = g - w;  // G residual (chromatic)
+      dst[i * 4 + 2] = b - w;  // B residual (chromatic)
+      dst[i * 4 + 3] = w;      // W = common brightness
+      sp += 3;
+    }
+  } else {  // RGBWMode::NONE
+    // RGB passthrough, W=0
+    for (size_t i = 0; i < pixel_count; ++i) {
+      dst[i * 4 + 0] = sp[0];  // R
+      dst[i * 4 + 1] = sp[1];  // G
+      dst[i * 4 + 2] = sp[2];  // B
+      dst[i * 4 + 3] = 0;      // W = 0
+      sp += 3;
+    }
+  }
+}
+
+// Convert RGB565 to RGBW with configurable white channel mode
+// Safe to call from UDP task (pure math, no allocations or API calls)
+// Inline so it can be used across components without linkage issues
+//
+// Algorithm: Expand RGB565 to RGB888, then apply white channel mode
+//
+// dst: Destination buffer for RGBW pixels (must be pre-allocated, 4 bytes per pixel)
+// src: Source RGB565 data (2 bytes per pixel)
+// pixel_count: Number of pixels to convert
+// src_big_endian: If true, source is RGB565 big-endian; if false, little-endian
+// mode: White channel conversion mode
+inline void convert_rgb565_to_rgbw(uint8_t* dst, const uint8_t* src,
+                                    size_t pixel_count, bool src_big_endian,
+                                    RGBWMode mode) {
+  if (!dst || !src) return;
+
+  const uint8_t* sp = src;
+
+  for (size_t i = 0; i < pixel_count; ++i) {
+    // Extract RGB565 value (handle endianness)
+    uint16_t v = src_big_endian ? (uint16_t)((sp[0] << 8) | sp[1])
+                                : (uint16_t)((sp[1] << 8) | sp[0]);
+
+    // Extract 5/6/5 bit components
+    uint8_t r5 = (uint8_t)((v >> 11) & 0x1F);
+    uint8_t g6 = (uint8_t)((v >> 5)  & 0x3F);
+    uint8_t b5 = (uint8_t)( v        & 0x1F);
+
+    // Expand to 8-bit (scale + replicate MSBs into LSBs)
+    uint8_t r = (uint8_t)((r5 << 3) | (r5 >> 2));
+    uint8_t g = (uint8_t)((g6 << 2) | (g6 >> 4));
+    uint8_t b = (uint8_t)((b5 << 3) | (b5 >> 2));
+
+    if (mode == RGBWMode::ACCURATE) {
+      // Extract white and reduce RGB
+      uint8_t w = r < g ? (r < b ? r : b) : (g < b ? g : b);
+      dst[i * 4 + 0] = r - w;  // R residual (chromatic)
+      dst[i * 4 + 1] = g - w;  // G residual (chromatic)
+      dst[i * 4 + 2] = b - w;  // B residual (chromatic)
+      dst[i * 4 + 3] = w;      // W = common brightness
+    } else {  // RGBWMode::NONE
+      // RGB passthrough, W=0
+      dst[i * 4 + 0] = r;  // R
+      dst[i * 4 + 1] = g;  // G
+      dst[i * 4 + 2] = b;  // B
+      dst[i * 4 + 3] = 0;  // W = 0
+    }
+    sp += 2;
   }
 }
 

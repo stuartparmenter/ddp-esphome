@@ -47,6 +47,9 @@ class DdpLightEffect : public light::AddressableLightEffect, public DdpRenderer 
   size_t frame_pixels_{0};          // Expected pixel count (num_leds)
   std::atomic<bool> frame_ready_{false};  // True when frame is ready to apply()
 
+  // White channel support detection
+  bool supports_white_{false};  // True if strip supports ColorMode::RGB_WHITE
+
   // Allocator for frame buffer (tries PSRAM first, falls back to internal RAM)
   RAMAllocator<uint8_t> allocator_;
 };
