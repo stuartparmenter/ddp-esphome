@@ -37,7 +37,7 @@ wifi:
 
 # External components - pull from GitHub
 external_components:
-  - source: github://stuartparmenter/lvgl-ddp-stream@main
+  - source: github://stuartparmenter/ddp-esphome@main
     components: [ddp, ddp_canvas, media_proxy_control]
     refresh: 0s
 

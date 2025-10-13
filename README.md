@@ -1,10 +1,10 @@
-# lvgl-ddp-stream
+# ddp-esphome
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![ESPHome](https://img.shields.io/badge/ESPHome-2025.8-blue)](https://esphome.io/)
 [![ESP-IDF](https://img.shields.io/badge/ESP--IDF-5.x-orange)](https://docs.espressif.com/projects/esp-idf/)
 
-ESPHome external components for streaming images/video to **LVGL** canvases and **AddressableLight** LED strips via **DDP** (Distributed Display Protocol) over UDP.
+ESPHome external components for streaming images/video to **LVGL** displays and **AddressableLight** LED strips via **DDP** (Distributed Display Protocol) over UDP.
 
 **📚 Documentation:**
 - [DDP Protocol Specification](http://www.3waylabs.com/ddp/) - Official DDP protocol documentation
@@ -14,19 +14,14 @@ ESPHome external components for streaming images/video to **LVGL** canvases and 
 
 This repository provides a modular set of ESPHome components:
 
-### Core Components
 - **`ddp`**: Core UDP server that receives DDP packets and dispatches to renderers
 - **`ddp_canvas`**: LVGL canvas renderer with triple-buffering support
 - **`ddp_light_effect`**: AddressableLight effect for RGB/RGBW LED strips
-- **`media_proxy_control`**: WebSocket client for orchestrating video playback via a media proxy server
-
-### Legacy Components (Deprecated)
-- **`ddp_stream`**: Old monolithic component (replaced by `ddp` + `ddp_canvas`)
-- **`ws_ddp_control`**: Old WebSocket component (replaced by `media_proxy_control`)
-
-> **Migration Note:** Existing configurations using `ddp_stream` and `ws_ddp_control` will continue to work, but new projects should use the new modular components for better flexibility and features.
+- **`media_proxy_control`**: WebSocket client for orchestrating media playback (images, videos, etc.) via the [media-proxy server](https://github.com/stuartparmenter/media-proxy)
 
 > Tested with **ESPHome 2025.8** (ESP-IDF only). Arduino is **not** supported.
+
+> **Note:** Legacy components `ddp_stream` and `ws_ddp_control` were removed in v0.7.0. Users on these components should use **v0.6.1** or earlier, or migrate to the new modular architecture. See examples for migration guidance.
 
 ### Standalone Usage
 
@@ -50,133 +45,13 @@ You only need `media_proxy_control` if you want to use the companion media proxy
 
 Multiple ready-made example configurations are provided:
 
-**New Modular Components:**
 - **[media-proxy-canvas.yaml](esphome/examples/media-proxy-canvas.yaml)** - **Recommended starting point**: Canvas video streaming with media proxy control
 - **[ddp-test-canvas.yaml](esphome/examples/ddp-test-canvas.yaml)** - Minimal standalone canvas example (no media proxy)
 - **[ddp-test-light-rgb.yaml](esphome/examples/ddp-test-light-rgb.yaml)** - RGB LED strip streaming
 - **[ddp-test-light-rgbw.yaml](esphome/examples/ddp-test-light-rgbw.yaml)** - RGBW LED strip streaming
 - **[ddp-test-multi-renderer.yaml](esphome/examples/ddp-test-multi-renderer.yaml)** - Advanced: Mirror same stream to canvas AND LEDs simultaneously
 
-**Legacy Components (still functional):**
-- **[ddp-receiver-only.yaml](esphome/examples/ddp-receiver-only.yaml)** - Standalone DDP receiver using legacy `ddp_stream`
-- **[ddp-websocket-full.yaml](esphome/examples/ddp-websocket-full.yaml)** - Full setup using legacy `ws_ddp_control`
-
 Move sensitive values like Wi-Fi credentials and video sources to your `secrets.yaml`.
-
----
-
-## Configuration Reference
-
-### `ddp_stream`
-
-```yaml
-ddp_stream:
-  id: ddp
-  port: 4048
-  streams:
-    - id: stream_1
-      canvas: canvas64
-      # stream: 1               # Uncomment and set to 1 for LedFx compatibility
-      receiving:                # Optional: binary sensor for monitoring
-        name: "Stream 1 Receiving"
-        device_class: connectivity
-```
-
-**Parameters:**
-- `id`: Component identifier for referencing in other components
-- `port`: UDP port to listen on for DDP packets
-- `back_buffers`: Default number of back buffers for smoother rendering (0=no buffering, 1-2=buffered)
-- `streams`: List of DDP stream configurations
-  - `id`: ESPHome component ID for this stream output
-  - `canvas`: Name of the LVGL canvas object to render to
-  - `stream`: DDP stream number (1-249). Use `1` for LedFx compatibility. Auto-generated if omitted.
-  - `width`/`height`: Override canvas dimensions if needed
-  - `back_buffers`: Per-stream back buffer override
-  - `receiving`: Optional binary sensor to track if stream is receiving data
-    - Supports all standard ESPHome binary sensor options (name, device_class, filters, etc.)
-    - State is `ON` when packets are actively being received
-    - State is `OFF` when no packets received for 1 second
-    - Useful for monitoring stream connectivity and debugging
-
-### `ws_ddp_control`
-
-```yaml
-ws_ddp_control:
-  id: ws
-  ddp: ddp
-  ws_host: "homeassistant.local"
-  ws_port: 8788
-  outputs:
-    - id: output_1
-      ddp_stream: stream_1
-      src: "video.mp4"
-      format: rgb565            # Use rgb565 for better performance on ESP32
-```
-
-**Parameters:**
-- `id`: Component identifier for referencing in actions
-- `ddp`: Reference to the `ddp_stream` component
-- `ws_host`: Hostname or IP address of media proxy server
-- `ws_port`: WebSocket port on media proxy server
-- `device_id`: Identifier sent to media proxy for device tracking
-- `url`: Full WebSocket URL (overrides `ws_host` and `ws_port` if provided)
-- `outputs`: List of video output configurations
-  - `id`: ESPHome component ID for this output
-  - `ddp_stream`: Reference to a `ddp_stream` stream component
-  - `src`: Video source (local file, HTTP/HTTPS URL, RTSP stream, etc.)
-  - `width`/`height`: Output dimensions (auto-detected from canvas if omitted)
-  - `format`: Pixel format for transmission. The `ddp_stream` component auto-detects rgb565le vs rgb565be. (rgb888 for quality, rgb565 for bandwidth)
-  - `pace`: Frame timing adjustment in milliseconds (negative=speed up, positive=slow down). **Server has good defaults; rarely needs adjustment.**
-  - `ema`: Exponential moving average smoothing for frame timing stability. **Server has good defaults; rarely needs adjustment.**
-  - `expand`: Color range expansion from TV range (16-235) to PC range (0-255). **Server has good defaults; rarely needs adjustment.**
-  - `fit`: How to fit video to canvas (auto=letterbox/pillarbox, pad=always letterbox, cover=fill and crop). **Server defaults to auto.**
-  - `loop`: Whether to loop video playback
-  - `hw`: Hardware acceleration method (depends on media proxy server capabilities). **Server has good defaults; rarely needs adjustment.**
-
-### Using Actions
-
-```yaml
-# Runtime source change example
-- ws_ddp_control.set_src:
-    id: output_1                # Reference the WsDdpOutput component directly
-    src: "new_video.mp4"
-```
-
----
-
-## Network Discovery
-
-The `ddp_stream` component automatically advertises via **mDNS/Zeroconf** as `_ddp._udp.local.` for zero-configuration discovery on the local network.
-
-**📖 Full Discovery Specification:** See [DDP-MDNS-DISCOVERY.md](DDP-MDNS-DISCOVERY.md) for complete technical details, TXT record format, and implementation guidelines.
-
-**Note:** While other DDP senders could use mDNS to find devices, most current implementations don't implement discovery yet.
-
-### Quick Start
-
-Devices advertise with these TXT records:
-- `txtvers=1` - TXT record format version
-- `protovers=1` - DDP protocol version
-- `fmts=rgb888,rgb565` - Supported pixel formats
-- `ids=1,2,3` - Available DDP Destination IDs
-- `id1=64x64` - Optional: Dimensions for each ID
-
-### Configuring Discovery
-
-To advertise display dimensions via mDNS, configure explicit `width` and `height`:
-
-```yaml
-ddp_stream:
-  streams:
-    - canvas: my_canvas
-      stream: 1
-      width: 64      # Advertised via mDNS for discovery
-      height: 64     # Without these, dimensions are determined from canvas at runtime
-```
-
-**Note:** If width/height are not specified, the stream will still work (dimensions come from the bound canvas), but senders won't know the resolution in advance.
-
-**Network considerations:** mDNS works reliably on most home/office networks but may be filtered on enterprise networks with strict multicast policies.
 
 ---
 
