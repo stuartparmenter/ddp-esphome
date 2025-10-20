@@ -143,15 +143,15 @@ void DdpComponent::loop() {
           double fps_delta = render_fps - push_fps;  // negative = falling behind
 
           ESP_LOGI(TAG,
-            "id=%u rx_pkts=%llu rx_B=%llu win{push=%.1ffps rx=%.2fMb/s wire=%.2fMb/s pkt_gap=%u} "
-            "tot{push=%u} build(avg)=%.1f ms lat(avg)=%.1f ms intra(max)=%.1f ms "
+            "id=%u rx_pkts=%llu rx_B=%llu win{push=%.1ffps rx=%.2fMb/s wire=%.2fMb/s pkt_gap=%u dup=%u} "
+            "tot{push=%u dup=%llu} build(avg)=%.1f ms lat(avg)=%.1f ms intra(max)=%.1f ms "
             "rx_slc{wakeups=%u pkts/burst=%.2f} "
             "render{display=%.1ffps Δ%.1f cov=%.1f%% lat=%.1fms queue=%.1fms} tot{present=%u}",
             (unsigned)id,
             (unsigned long long)m.rx_pkts,
             (unsigned long long)m.rx_bytes,
-            push_fps, rx_mbps, rx_wire_mbps, m.win_pkt_gap,
-            m.frames_push,
+            push_fps, rx_mbps, rx_wire_mbps, m.win_pkt_gap, m.win_pkts_duplicate,
+            m.frames_push, (unsigned long long)m.rx_pkts_duplicate,
             m.build_ms_ewma, lat_ms, m.intra_ms_max,
             m.rx_wakeups, pkts_per_wakeup,
             render_fps, fps_delta, render_cov_pct, render_lat_ms, r_metrics->queue_wait_ms_ewma,
@@ -165,14 +165,14 @@ void DdpComponent::loop() {
         {
           // Protocol metrics only (no renderer or metrics disabled)
           ESP_LOGI(TAG,
-            "id=%u rx_pkts=%llu rx_B=%llu win{push=%.1ffps rx=%.2fMb/s wire=%.2fMb/s pkt_gap=%u} "
-            "tot{push=%u} build(avg)=%.1f ms lat(avg)=%.1f ms intra(max)=%.1f ms "
+            "id=%u rx_pkts=%llu rx_B=%llu win{push=%.1ffps rx=%.2fMb/s wire=%.2fMb/s pkt_gap=%u dup=%u} "
+            "tot{push=%u dup=%llu} build(avg)=%.1f ms lat(avg)=%.1f ms intra(max)=%.1f ms "
             "rx_slc{wakeups=%u pkts/burst=%.2f}",
             (unsigned)id,
             (unsigned long long)m.rx_pkts,
             (unsigned long long)m.rx_bytes,
-            push_fps, rx_mbps, rx_wire_mbps, m.win_pkt_gap,
-            m.frames_push,
+            push_fps, rx_mbps, rx_wire_mbps, m.win_pkt_gap, m.win_pkts_duplicate,
+            m.frames_push, (unsigned long long)m.rx_pkts_duplicate,
             m.build_ms_ewma, lat_ms, m.intra_ms_max,
             m.rx_wakeups, pkts_per_wakeup
           );
@@ -186,6 +186,7 @@ void DdpComponent::loop() {
       m.win_rx_bytes = 0;
       m.win_rx_wire_bytes = 0;
       m.win_pkt_gap = 0;
+      m.win_pkts_duplicate = 0;
       m.intra_ms_max = 0.0;
       m.log_t0_us = now;
     }
@@ -451,22 +452,39 @@ void DdpComponent::handle_packet_(const uint8_t *raw, size_t n) {
       return; // unknown format; ignore (skip metrics for invalid packets)
   }
 
-  handle_pixel_data_(stream_id, h, p, len, bytes_per_pixel, format);
+  // Per-packet sequencing (duplicate detection and gap detection)
+  uint8_t cur_pkt = (uint8_t)(h->seq & 0x0F);
+  auto& state = stream_state_[stream_id];
+
+  // Drop back-to-back duplicates (same seq number as previous packet)
+  // Per DDP spec: "a receiver can ignore duplicates received back-to-back"
+  // Note: seq=0 means "not used", so never dedupe those packets
+  if (state.have_last_seq_pkt && cur_pkt != 0) {
+    uint8_t prev = state.last_seq_pkt & 0x0F;
+    if (cur_pkt == prev) {
+      // This is a duplicate packet - drop it
+#if DDP_METRICS
+      m.rx_pkts_duplicate += 1;
+      m.win_pkts_duplicate += 1;
+#endif
+      return;
+    }
 
 #if DDP_METRICS
-  // Per-packet sequencing (gap detection)
-  uint8_t cur_pkt = (uint8_t)(h->seq & 0x0F);
-  if (m.have_last_seq_pkt) {
-    uint8_t prev = m.last_seq_pkt & 0x0F;
+    // Gap detection (only for non-duplicates)
     uint8_t delta = (uint8_t)((cur_pkt - prev) & 0x0F);
     if (delta > 1) {
       uint32_t add = (uint32_t)(delta - 1);
       m.win_pkt_gap += add;
     }
+#endif
   }
-  m.last_seq_pkt = cur_pkt;
-  m.have_last_seq_pkt = true;
+  state.last_seq_pkt = cur_pkt;
+  state.have_last_seq_pkt = true;
 
+  handle_pixel_data_(stream_id, h, p, len, bytes_per_pixel, format);
+
+#if DDP_METRICS
   // Track max intra-packet gap (diagnostic for burstiness/Jitter)
   int64_t nowp = esp_timer_get_time();
   if (m.last_pkt_us != 0) {
