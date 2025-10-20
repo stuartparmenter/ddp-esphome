@@ -112,6 +112,13 @@ class DdpComponent : public Component {
   void register_mdns_service_();
   std::vector<std::string> txt_storage_;  // Persistent storage for mDNS TXT record strings
 
+  // Per-stream sequence tracking (always enabled for duplicate detection)
+  struct StreamState {
+    uint8_t last_seq_pkt{0};
+    bool have_last_seq_pkt{false};
+  };
+  std::map<uint8_t, StreamState> stream_state_;
+
 #if DDP_METRICS
   // Per-stream metrics
   struct StreamMetrics {
@@ -119,6 +126,7 @@ class DdpComponent : public Component {
     uint64_t rx_pkts{0};
     uint64_t rx_bytes{0};         // DDP pixel payload bytes (header excluded)
     uint64_t rx_wire_bytes{0};    // UDP payload bytes (header included)
+    uint64_t rx_pkts_duplicate{0}; // Back-to-back duplicate packets dropped
 
     // Frame assembly
     size_t frame_bytes_accum{0};
@@ -129,10 +137,6 @@ class DdpComponent : public Component {
     // Frame accounting
     uint32_t frames_started{0};
     uint32_t frames_push{0};
-
-    // Sequencing
-    uint8_t last_seq_pkt{0};
-    bool have_last_seq_pkt{false};
 
     // EWMA
     double dispatch_lat_us_ewma{0.0};  // Time from first packet to dispatch
@@ -148,6 +152,7 @@ class DdpComponent : public Component {
     uint64_t win_rx_bytes{0};        // payload only
     uint64_t win_rx_wire_bytes{0};   // UDP payload (wire)
     uint32_t win_pkt_gap{0};
+    uint32_t win_pkts_duplicate{0};  // Duplicates dropped in this window
 
     // Max inter-packet gap within a frame
     double intra_ms_max{0.0};
