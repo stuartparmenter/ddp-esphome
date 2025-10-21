@@ -16,63 +16,75 @@ ddp_ns = cg.esphome_ns.namespace("ddp")
 DdpComponent = ddp_ns.class_("DdpComponent", cg.Component)
 DdpCanvas = ddp_ns.class_("DdpCanvas", cg.Component)
 
-CONF_WS_HOST   = "ws_host"
-CONF_WS_PORT   = "ws_port"
+CONF_WS_HOST = "ws_host"
+CONF_WS_PORT = "ws_port"
 CONF_DEVICE_ID = "device_id"
-CONF_DDP       = "ddp"
-CONF_OUTPUTS   = "outputs"
-CONF_STREAM    = "stream"
-CONF_SRC       = "src"
+CONF_DDP = "ddp"
+CONF_OUTPUTS = "outputs"
+CONF_STREAM = "stream"
+CONF_SRC = "src"
 
-OUTPUT_SCHEMA = cv.Schema({
-    cv.GenerateID(): cv.declare_id(MediaProxyOutput),
-    cv.Required(CONF_STREAM): cv.Any(
-        cv.int_range(min=1, max=249),
-        cv.use_id(DdpCanvas),
-    ),
+OUTPUT_SCHEMA = cv.Schema(
+    {
+        cv.GenerateID(): cv.declare_id(MediaProxyOutput),
+        cv.Required(CONF_STREAM): cv.Any(
+            cv.int_range(min=1, max=249),
+            cv.use_id(DdpCanvas),
+        ),
+        cv.Required("src"): cv.string,
+        cv.Optional("pace"): cv.int_range(min=0, max=240),
+        cv.Optional("ema"): cv.float_range(min=0.0, max=1.0),
+        cv.Optional("expand"): cv.Any(
+            cv.int_range(min=0, max=2),
+            cv.one_of("never", "auto", "force", "0", "1", "2", lower=True),
+        ),
+        cv.Optional("loop"): cv.boolean,
+        cv.Optional("hw"): cv.one_of(
+            "auto",
+            "none",
+            "cuda",
+            "qsv",
+            "vaapi",
+            "videotoolbox",
+            "d3d11va",
+            lower=True,
+        ),
+        cv.Optional("format"): cv.one_of(
+            "rgb888", "rgb565", "rgb565le", "rgb565be", "rgbw", lower=True
+        ),
+        cv.Optional("fit"): cv.one_of("auto", "pad", "cover", lower=True),
+    }
+)
 
-    cv.Required("src"): cv.string,
-    cv.Optional("pace"): cv.int_range(min=0, max=240),
-    cv.Optional("ema"): cv.float_range(min=0.0, max=1.0),
-    cv.Optional("expand"): cv.Any(
-        cv.int_range(min=0, max=2),
-        cv.one_of("never", "auto", "force", "0", "1", "2", lower=True),
-    ),
-    cv.Optional("loop"): cv.boolean,
-    cv.Optional("hw"): cv.one_of(
-        "auto", "none", "cuda", "qsv", "vaapi", "videotoolbox", "d3d11va", lower=True
-    ),
-    cv.Optional("format"): cv.one_of(
-        "rgb888", "rgb565", "rgb565le", "rgb565be", "rgbw", lower=True
-    ),
-    cv.Optional("fit"): cv.one_of("auto", "pad", "cover", lower=True),
-})
-
-CONFIG_SCHEMA = cv.Schema({
-    cv.GenerateID(CONF_ID): cv.declare_id(MediaProxyControl),
-    # URL override (optional)
-    cv.Optional(CONF_URL, default=""): cv.templatable(cv.string),
-    cv.Optional(CONF_WS_HOST): cv.templatable(cv.string),
-    cv.Optional(CONF_WS_PORT, default=8788): cv.int_range(min=1, max=65535),
-    cv.Optional(CONF_DEVICE_ID, default="unknown"): cv.templatable(cv.string),
-
-    # Orchestration
-    cv.GenerateID(CONF_DDP): cv.use_id(DdpComponent),
-    cv.Optional(CONF_OUTPUTS, default=[]): cv.ensure_list(OUTPUT_SCHEMA),
-}).extend(cv.COMPONENT_SCHEMA)
+CONFIG_SCHEMA = cv.Schema(
+    {
+        cv.GenerateID(CONF_ID): cv.declare_id(MediaProxyControl),
+        # URL override (optional)
+        cv.Optional(CONF_URL, default=""): cv.templatable(cv.string),
+        cv.Optional(CONF_WS_HOST): cv.templatable(cv.string),
+        cv.Optional(CONF_WS_PORT, default=8788): cv.int_range(min=1, max=65535),
+        cv.Optional(CONF_DEVICE_ID, default="unknown"): cv.templatable(cv.string),
+        # Orchestration
+        cv.GenerateID(CONF_DDP): cv.use_id(DdpComponent),
+        cv.Optional(CONF_OUTPUTS, default=[]): cv.ensure_list(OUTPUT_SCHEMA),
+    }
+).extend(cv.COMPONENT_SCHEMA)
 
 # Actions
 SetSourceAction = media_proxy_ns.class_("SetSourceAction", automation.Action)
 StartAction = media_proxy_ns.class_("StartAction", automation.Action)
 StopAction = media_proxy_ns.class_("StopAction", automation.Action)
 
+
 @automation.register_action(
     "media_proxy_control.set_source",
     SetSourceAction,
-    cv.Schema({
-        cv.GenerateID(CONF_ID): cv.use_id(MediaProxyOutput),
-        cv.Required(CONF_SRC): cv.templatable(cv.string),
-    })
+    cv.Schema(
+        {
+            cv.GenerateID(CONF_ID): cv.use_id(MediaProxyOutput),
+            cv.Required(CONF_SRC): cv.templatable(cv.string),
+        }
+    ),
 )
 async def set_source_action_to_code(config, action_id, template_arg, args):
     output = await cg.get_variable(config[CONF_ID])
@@ -81,32 +93,40 @@ async def set_source_action_to_code(config, action_id, template_arg, args):
     cg.add(var.set_src(src_templ))
     return var
 
+
 @automation.register_action(
     "media_proxy_control.start",
     StartAction,
-    cv.Schema({
-        cv.GenerateID(CONF_ID): cv.use_id(MediaProxyOutput),
-    })
+    cv.Schema(
+        {
+            cv.GenerateID(CONF_ID): cv.use_id(MediaProxyOutput),
+        }
+    ),
 )
 async def start_action_to_code(config, action_id, template_arg, args):
     output = await cg.get_variable(config[CONF_ID])
     var = cg.new_Pvariable(action_id, template_arg, output)
     return var
 
+
 @automation.register_action(
     "media_proxy_control.stop",
     StopAction,
-    cv.Schema({
-        cv.GenerateID(CONF_ID): cv.use_id(MediaProxyOutput),
-    })
+    cv.Schema(
+        {
+            cv.GenerateID(CONF_ID): cv.use_id(MediaProxyOutput),
+        }
+    ),
 )
 async def stop_action_to_code(config, action_id, template_arg, args):
     output = await cg.get_variable(config[CONF_ID])
     var = cg.new_Pvariable(action_id, template_arg, output)
     return var
 
+
 def _templ(expr):
     return cg.templatable(expr, [], cg.std_string)
+
 
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
@@ -146,20 +166,32 @@ async def to_code(config):
             exp_i = max(0, min(2, int(exp)))
         else:
             e = str(exp).strip().lower()
-            if e in ("never", "0"):   exp_i = 0
-            elif e in ("auto",  "1"): exp_i = 1
-            elif e in ("force", "2"): exp_i = 2
-            else:                     exp_i = 1
+            if e in ("never", "0"):
+                exp_i = 0
+            elif e in ("auto", "1"):
+                exp_i = 1
+            elif e in ("force", "2"):
+                exp_i = 2
+            else:
+                exp_i = 1
 
         # Set all configuration before wiring up parent (avoids spurious updates during init)
-        if "src" in s: cg.add(output.set_src(s["src"]))
-        if "pace" in s: cg.add(output.set_pace(s["pace"]))
-        if "ema" in s: cg.add(output.set_ema(s["ema"]))
-        if exp_i is not None: cg.add(output.set_expand(exp_i))
-        if "loop" in s: cg.add(output.set_loop(s["loop"]))
-        if "hw" in s: cg.add(output.set_hw(s["hw"]))
-        if "format" in s: cg.add(output.set_format(s["format"]))
-        if "fit" in s: cg.add(output.set_fit(s["fit"]))
+        if "src" in s:
+            cg.add(output.set_src(s["src"]))
+        if "pace" in s:
+            cg.add(output.set_pace(s["pace"]))
+        if "ema" in s:
+            cg.add(output.set_ema(s["ema"]))
+        if exp_i is not None:
+            cg.add(output.set_expand(exp_i))
+        if "loop" in s:
+            cg.add(output.set_loop(s["loop"]))
+        if "hw" in s:
+            cg.add(output.set_hw(s["hw"]))
+        if "format" in s:
+            cg.add(output.set_format(s["format"]))
+        if "fit" in s:
+            cg.add(output.set_fit(s["fit"]))
 
         # Wire up parent last, after all configuration is set
         cg.add(output.set_parent(var))

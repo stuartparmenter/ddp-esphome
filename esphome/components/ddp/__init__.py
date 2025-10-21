@@ -24,11 +24,15 @@ CONF_METRICS = "metrics"
 _used_stream_ids = set()
 _next_auto_stream_id = 2
 
+
 def register_stream_id(stream_id):
     """Register an explicitly specified stream ID."""
     if stream_id in _used_stream_ids:
-        raise cv.Invalid(f"Duplicate DDP stream ID {stream_id}! Each stream ID must be unique across all ddp_canvas and ddp_light_effect components.")
+        raise cv.Invalid(
+            f"Duplicate DDP stream ID {stream_id}! Each stream ID must be unique across all ddp_canvas and ddp_light_effect components."
+        )
     _used_stream_ids.add(stream_id)
+
 
 def allocate_stream_id():
     """Allocate the next available auto-generated stream ID."""
@@ -46,12 +50,16 @@ def allocate_stream_id():
 
     return stream_id
 
+
 # DDP component schema
-CONFIG_SCHEMA = cv.Schema({
-    cv.GenerateID(): cv.declare_id(DdpComponent),
-    cv.Optional(CONF_PORT, default=4048): cv.port,
-    cv.Optional(CONF_METRICS, default=False): cv.boolean,
-}).extend(cv.COMPONENT_SCHEMA)
+CONFIG_SCHEMA = cv.Schema(
+    {
+        cv.GenerateID(): cv.declare_id(DdpComponent),
+        cv.Optional(CONF_PORT, default=4048): cv.port,
+        cv.Optional(CONF_METRICS, default=False): cv.boolean,
+    }
+).extend(cv.COMPONENT_SCHEMA)
+
 
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
@@ -70,7 +78,9 @@ async def to_code(config):
     "DDP Stream",
     {
         cv.GenerateID(CONF_DDP_ID): cv.use_id(DdpComponent),
-        cv.Optional(CONF_STREAM): cv.int_range(min=1, max=249),  # Optional - auto-generates if not specified
+        cv.Optional(CONF_STREAM): cv.int_range(
+            min=1, max=249
+        ),  # Optional - auto-generates if not specified
     },
 )
 async def ddp_light_effect_to_code(config, effect_id):
