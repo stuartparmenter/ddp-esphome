@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2025-10-20
+
+### Fixed
+- Drop back-to-back duplicate sequenced DDP packets to reduce redundant processing
+
+## [0.7.1] - 2025-10-13
+
+### Fixed
+- Fix string usage in logs
+
 ## [0.7.0] - 2025-10-12
 
 ### Changed
@@ -163,7 +173,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ESPHome external components: `ddp_stream`, `ws_ddp_control`
 - Example LVGL page: `page-ddp-stream.yaml`
 
-[unreleased]: https://github.com/stuartparmenter/ddp-esphome/compare/v0.7.0...HEAD
+[unreleased]: https://github.com/stuartparmenter/ddp-esphome/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/stuartparmenter/ddp-esphome/compare/v0.7.1...v0.7.2
+[0.7.1]: https://github.com/stuartparmenter/ddp-esphome/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/stuartparmenter/ddp-esphome/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/stuartparmenter/ddp-esphome/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/stuartparmenter/ddp-esphome/compare/v0.5.3...v0.6.0
