@@ -9,11 +9,22 @@
 #include "esphome/core/helpers.h"
 #include <cstring>
 #include <algorithm>
+#include <type_traits>
 
 namespace esphome {
 namespace ddp {
 
 static const char* TAG = "ddp.light_effect";
+
+// Helper to extract const char* from either std::string or const char*
+template<typename T>
+static inline const char* get_cstr(const T& val) {
+  if constexpr (std::is_pointer_v<T>) {
+    return val;  // Already const char*
+  } else {
+    return val.c_str();  // std::string, call .c_str()
+  }
+}
 
 // -------- DdpRenderer interface (UDP TASK CONTEXT) --------
 
@@ -76,6 +87,13 @@ bool DdpLightEffect::get_dimensions(int* w, int* h) const {
   return false;
 }
 
+const char* DdpLightEffect::get_name() const {
+  // Access base class name_ member directly (protected)
+  // Old ESPHome: name_ is std::string, call .c_str()
+  // New ESPHome (PR #11487): name_ is const char*, return directly
+  return get_cstr(name_);
+}
+
 // -------- AddressableLightEffect interface --------
 
 void DdpLightEffect::start() {
@@ -96,16 +114,16 @@ void DdpLightEffect::start() {
     auto traits = it->get_traits();
     supports_white_ = traits.supports_color_mode(light::ColorMode::RGB_WHITE);
     ESP_LOGI(TAG, "Started DDP light effect '%s' for stream %u (%d LEDs, %s strip)",
-             name_.c_str(), stream_id_, num_leds, supports_white_ ? "RGBW" : "RGB");
+             get_name(), stream_id_, num_leds, supports_white_ ? "RGBW" : "RGB");
   } else {
     ESP_LOGI(TAG, "Started DDP light effect '%s' for stream %u (%d LEDs)",
-             name_.c_str(), stream_id_, num_leds);
+             get_name(), stream_id_, num_leds);
   }
 }
 
 void DdpLightEffect::stop() {
   // Note: We don't unregister since registration is permanent (happens at codegen time)
-  ESP_LOGI(TAG, "Stopped DDP light effect '%s' for stream %u", name_.c_str(), stream_id_);
+  ESP_LOGI(TAG, "Stopped DDP light effect '%s' for stream %u", get_name(), stream_id_);
 
   // Free frame buffer (RGBW = 4 bytes per pixel)
   if (frame_buffer_) {

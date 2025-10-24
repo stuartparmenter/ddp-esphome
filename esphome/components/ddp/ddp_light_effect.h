@@ -18,7 +18,7 @@ namespace ddp {
 // DDP renderer that outputs to AddressableLight as an effect (like E1.31)
 class DdpLightEffect : public light::AddressableLightEffect, public DdpRenderer {
  public:
-  explicit DdpLightEffect(const std::string& name) : AddressableLightEffect(name) {}
+  explicit DdpLightEffect(const char* name) : AddressableLightEffect(name) {}
 
   // Configuration
   void set_parent(DdpComponent* parent) { parent_ = parent; }
@@ -30,7 +30,7 @@ class DdpLightEffect : public light::AddressableLightEffect, public DdpRenderer 
   void on_push() override;
   uint8_t get_stream_id() const override { return stream_id_; }
   bool get_dimensions(int* w, int* h) const override;
-  const char* get_name() const override { return name_.c_str(); }
+  const char* get_name() const override;
 
   // AddressableLightEffect interface (MAIN THREAD)
   void start() override;

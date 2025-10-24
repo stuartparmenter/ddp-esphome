@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Updated `DdpLightEffect` constructor to use `const char*` instead of `const std::string&` for compatibility with ESPHome 2025.11+ (PR #11487)
+  - This change aligns with upstream ESPHome's optimization to store effect names in flash memory instead of heap
+  - Fully backward compatible - works with both old and new ESPHome versions
+
 ## [0.7.2] - 2025-10-20
 
 ### Fixed
