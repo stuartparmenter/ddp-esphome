@@ -536,6 +536,10 @@ void DdpComponent::handle_push_(uint8_t stream_id, const DdpHeader* hdr) {
     this->enable_loop_soon_any_context();
   }
 
+  // Reset sequence state for next frame (allows sequence counter resets between frames)
+  auto& state = stream_state_[stream_id];
+  state.have_last_seq_pkt = false;
+
 #if DDP_METRICS
   // Reset frame assembly state
   m.frame_seen_any = false;
