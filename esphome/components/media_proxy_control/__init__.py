@@ -56,19 +56,36 @@ OUTPUT_SCHEMA = cv.Schema(
     }
 )
 
-CONFIG_SCHEMA = cv.Schema(
-    {
-        cv.GenerateID(CONF_ID): cv.declare_id(MediaProxyControl),
-        # URL override (optional)
-        cv.Optional(CONF_URL, default=""): cv.templatable(cv.string),
-        cv.Optional(CONF_WS_HOST): cv.templatable(cv.string),
-        cv.Optional(CONF_WS_PORT, default=8788): cv.int_range(min=1, max=65535),
-        cv.Optional(CONF_DEVICE_ID, default="unknown"): cv.templatable(cv.string),
-        # Orchestration
-        cv.GenerateID(CONF_DDP): cv.use_id(DdpComponent),
-        cv.Optional(CONF_OUTPUTS, default=[]): cv.ensure_list(OUTPUT_SCHEMA),
-    }
-).extend(cv.COMPONENT_SCHEMA)
+
+def _consume_media_proxy_sockets(config):
+    """Register socket needs for media_proxy_control component (ESPHome 2025.11+)."""
+    try:
+        from esphome.components import socket
+
+        # media_proxy_control needs 1 WebSocket connection
+        socket.consume_sockets(1, "media_proxy_control")(config)
+    except AttributeError:
+        # Backwards compatibility: socket.consume_sockets not available in older ESPHome
+        pass
+    return config
+
+
+CONFIG_SCHEMA = cv.All(
+    cv.Schema(
+        {
+            cv.GenerateID(CONF_ID): cv.declare_id(MediaProxyControl),
+            # URL override (optional)
+            cv.Optional(CONF_URL, default=""): cv.templatable(cv.string),
+            cv.Optional(CONF_WS_HOST): cv.templatable(cv.string),
+            cv.Optional(CONF_WS_PORT, default=8788): cv.int_range(min=1, max=65535),
+            cv.Optional(CONF_DEVICE_ID, default="unknown"): cv.templatable(cv.string),
+            # Orchestration
+            cv.GenerateID(CONF_DDP): cv.use_id(DdpComponent),
+            cv.Optional(CONF_OUTPUTS, default=[]): cv.ensure_list(OUTPUT_SCHEMA),
+        }
+    ).extend(cv.COMPONENT_SCHEMA),
+    _consume_media_proxy_sockets,
+)
 
 # Actions
 SetSourceAction = media_proxy_ns.class_("SetSourceAction", automation.Action)
