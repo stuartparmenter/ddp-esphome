@@ -5,6 +5,7 @@
 
 #include "ddp.h"
 #include "esphome/core/log.h"
+#include "esphome/core/application.h"
 #include "esphome/components/network/util.h"
 #include <algorithm>
 #include <cstdio>
@@ -504,6 +505,11 @@ void DdpComponent::handle_push_(uint8_t stream_id, const DdpHeader* hdr) {
   if (loop_is_disabled_.load(std::memory_order_acquire)) {
     this->enable_loop_soon_any_context();
   }
+
+  // Wake main loop immediately for low-latency frame presentation (ESPHome 2025.11+)
+#if defined(USE_SOCKET_SELECT_SUPPORT) && defined(USE_WAKE_LOOP_THREADSAFE)
+  App.wake_loop_threadsafe();
+#endif
 
 #if DDP_METRICS
   // Reset frame assembly state
