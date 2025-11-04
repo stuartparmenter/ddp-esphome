@@ -5,6 +5,7 @@
 
 #include "ddp.h"
 #include "esphome/core/log.h"
+#include "esphome/core/application.h"
 #include "esphome/components/network/util.h"
 #include <algorithm>
 #include <cstdio>
