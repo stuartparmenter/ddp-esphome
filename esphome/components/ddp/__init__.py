@@ -53,14 +53,30 @@ def allocate_stream_id():
     return stream_id
 
 
+def _consume_ddp_sockets(config):
+    """Register socket needs for DDP component (ESPHome 2025.11+)."""
+    try:
+        from esphome.components import socket
+
+        # DDP needs 1 listening UDP socket
+        socket.consume_sockets(1, "ddp")(config)
+    except AttributeError:
+        # Backwards compatibility: socket.consume_sockets not available in older ESPHome
+        pass
+    return config
+
+
 # DDP component schema
-CONFIG_SCHEMA = cv.Schema(
-    {
-        cv.GenerateID(): cv.declare_id(DdpComponent),
-        cv.Optional(CONF_PORT, default=4048): cv.port,
-        cv.Optional(CONF_METRICS, default=False): cv.boolean,
-    }
-).extend(cv.COMPONENT_SCHEMA)
+CONFIG_SCHEMA = cv.All(
+    cv.Schema(
+        {
+            cv.GenerateID(): cv.declare_id(DdpComponent),
+            cv.Optional(CONF_PORT, default=4048): cv.port,
+            cv.Optional(CONF_METRICS, default=False): cv.boolean,
+        }
+    ).extend(cv.COMPONENT_SCHEMA),
+    _consume_ddp_sockets,
+)
 
 
 async def to_code(config):
@@ -71,6 +87,14 @@ async def to_code(config):
     # Define DDP_METRICS build flag if metrics are enabled
     if config[CONF_METRICS]:
         cg.add_build_flag("-DDDP_METRICS")
+
+    # Enable wake_loop_threadsafe for low-latency wakeup (ESPHome 2025.11+)
+    try:
+        from esphome.components import socket
+        socket.require_wake_loop_threadsafe()
+    except AttributeError:
+        # Backward compatibility: not available in older ESPHome
+        pass
 
 
 # ========================================================================

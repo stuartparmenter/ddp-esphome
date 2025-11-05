@@ -98,6 +98,9 @@ inline void swap_rgb565_bytes(uint16_t* buf, size_t pixel_count) {
 // dst: Destination buffer for RGB32 pixels (must be pre-allocated)
 // src: Source RGB888 data (3 bytes per pixel: R, G, B)
 // pixel_count: Number of pixels to convert
+//
+// Note: LVGL lv_color32_t is always BGRA byte order in memory:
+//   struct { uint8_t blue; uint8_t green; uint8_t red; uint8_t alpha; }
 inline void convert_rgb888_to_rgb32(uint32_t* dst, const uint8_t* src,
                                      size_t pixel_count) {
   if (!dst || !src) return;
@@ -105,11 +108,11 @@ inline void convert_rgb888_to_rgb32(uint32_t* dst, const uint8_t* src,
   const uint8_t* sp = src;
 
   for (size_t i = 0; i < pixel_count; ++i) {
-    // LVGL RGB32 format: R, G, B, A (alpha = 0xFF)
-    uint32_t c = ((uint32_t)sp[0]) |           // Red
-                 ((uint32_t)sp[1] << 8) |      // Green
-                 ((uint32_t)sp[2] << 16) |     // Blue
-                 0xFF000000;                   // Alpha
+    // lv_color32_t is {blue, green, red, alpha} in memory
+    uint32_t c = ((uint32_t)sp[2]) |           // B (byte 0, from src[2])
+                 ((uint32_t)sp[1] << 8) |      // G (byte 1, from src[1])
+                 ((uint32_t)sp[0] << 16) |     // R (byte 2, from src[0])
+                 0xFF000000;                   // A (byte 3)
     dst[i] = c;
     sp += 3;
   }
@@ -152,6 +155,9 @@ inline void convert_rgbw_to_rgb565(uint16_t* dst, const uint8_t* src,
 // dst: Destination buffer for RGB32 pixels (must be pre-allocated)
 // src: Source RGBW data (4 bytes per pixel: R, G, B, W)
 // pixel_count: Number of pixels to convert
+//
+// Note: LVGL lv_color32_t is always BGRA byte order in memory:
+//   struct { uint8_t blue; uint8_t green; uint8_t red; uint8_t alpha; }
 inline void convert_rgbw_to_rgb32(uint32_t* dst, const uint8_t* src,
                                    size_t pixel_count) {
   if (!dst || !src) return;
@@ -159,11 +165,11 @@ inline void convert_rgbw_to_rgb32(uint32_t* dst, const uint8_t* src,
   const uint8_t* sp = src;
 
   for (size_t i = 0; i < pixel_count; ++i) {
-    // LVGL RGB32 format: R, G, B, A (alpha = 0xFF, W ignored)
-    uint32_t c = ((uint32_t)sp[0]) |           // Red
-                 ((uint32_t)sp[1] << 8) |      // Green
-                 ((uint32_t)sp[2] << 16) |     // Blue
-                 0xFF000000;                   // Alpha (sp[3] = W ignored)
+    // lv_color32_t is {blue, green, red, alpha} in memory
+    uint32_t c = ((uint32_t)sp[2]) |           // B (byte 0, from src[2])
+                 ((uint32_t)sp[1] << 8) |      // G (byte 1, from src[1])
+                 ((uint32_t)sp[0] << 16) |     // R (byte 2, from src[0])
+                 0xFF000000;                   // A (byte 3, src[3]=W ignored)
     dst[i] = c;
     sp += 4;
   }

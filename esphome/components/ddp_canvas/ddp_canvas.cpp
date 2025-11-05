@@ -127,11 +127,11 @@ void DdpCanvas::on_data(size_t offset_px, const uint8_t* pixels,
   uint32_t* dst32 = reinterpret_cast<uint32_t*>(dst_buf) + offset_px;
 
   if (format == PixelFormat::RGB888) {
-    // RGB888 → RGB32 (RGBA8888)
+    // RGB888 → RGB32 (lv_color32_t: BGRA byte order)
     convert_rgb888_to_rgb32(dst32, pixels, pixel_count);
 
   } else if (format == PixelFormat::RGB565_BE || format == PixelFormat::RGB565_LE) {
-    // RGB565 → RGB32 (manual expansion)
+    // RGB565 → RGB32 (lv_color32_t: BGRA byte order)
     const bool src_be = (format == PixelFormat::RGB565_BE);
     const uint8_t* sp = pixels;
 
@@ -142,16 +142,17 @@ void DdpCanvas::on_data(size_t offset_px, const uint8_t* pixels,
       uint8_t g6 = (uint8_t)((v >> 5)  & 0x3F);
       uint8_t b5 = (uint8_t)( v        & 0x1F);
 
-      uint32_t c = ((r5 << 3) | (r5 >> 2)) |        // R
-                   (((g6 << 2) | (g6 >> 4)) << 8) | // G
-                   (((b5 << 3) | (b5 >> 2)) << 16) | // B
-                   (0xFF << 24);                     // A
+      // Expand to 8-bit: lv_color32_t is {blue, green, red, alpha} in memory
+      uint32_t c = ((b5 << 3) | (b5 >> 2)) |         // B (byte 0)
+                   (((g6 << 2) | (g6 >> 4)) << 8) |  // G (byte 1)
+                   (((r5 << 3) | (r5 >> 2)) << 16) | // R (byte 2)
+                   (0xFF << 24);                     // A (byte 3)
       dst32[i] = c;
       sp += 2;
     }
 
   } else if (format == PixelFormat::RGBW) {
-    // RGBW → RGB32 (drop W channel, use 0xFF for alpha)
+    // RGBW → RGB32 (lv_color32_t: BGRA byte order, drop W channel)
     convert_rgbw_to_rgb32(dst32, pixels, pixel_count);
   }
 #endif

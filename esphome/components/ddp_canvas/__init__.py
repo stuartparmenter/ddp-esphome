@@ -24,18 +24,21 @@ CONF_BACK_BUFFERS = "back_buffers"
 CONF_RECEIVING = "receiving"
 
 # Canvas renderer schema
-CONFIG_SCHEMA = cv.Schema({
-    cv.GenerateID(): cv.declare_id(DdpCanvas),
-    cv.GenerateID(CONF_DDP_ID): cv.use_id(DdpComponent),
-    cv.Optional(CONF_STREAM): cv.int_range(min=1, max=249),  # Optional now!
-    cv.Required(CONF_CANVAS): cv.string,
-    cv.Optional("width", default=-1): cv.int_,
-    cv.Optional("height", default=-1): cv.int_,
-    cv.Optional(CONF_BACK_BUFFERS, default=2): cv.one_of(0, 1, 2, int=True),
-    cv.Optional(CONF_RECEIVING): binary_sensor.binary_sensor_schema(
-        binary_sensor.BinarySensor
-    ),
-}).extend(cv.COMPONENT_SCHEMA)
+CONFIG_SCHEMA = cv.Schema(
+    {
+        cv.GenerateID(): cv.declare_id(DdpCanvas),
+        cv.GenerateID(CONF_DDP_ID): cv.use_id(DdpComponent),
+        cv.Optional(CONF_STREAM): cv.int_range(min=1, max=249),  # Optional now!
+        cv.Required(CONF_CANVAS): cv.string,
+        cv.Optional("width", default=-1): cv.int_,
+        cv.Optional("height", default=-1): cv.int_,
+        cv.Optional(CONF_BACK_BUFFERS, default=2): cv.one_of(0, 1, 2, int=True),
+        cv.Optional(CONF_RECEIVING): binary_sensor.binary_sensor_schema(
+            binary_sensor.BinarySensor
+        ),
+    }
+).extend(cv.COMPONENT_SCHEMA)
+
 
 async def to_code(config):
     """Register a canvas renderer"""
@@ -58,7 +61,7 @@ async def to_code(config):
 
     # Set canvas getter (lambda to resolve LVGL object at runtime)
     canvas = config[CONF_CANVAS]
-    getter = cg.RawExpression(f'[]() -> lv_obj_t* {{ return &id({canvas}); }}')
+    getter = cg.RawExpression(f"[]() -> lv_obj_t* {{ return &id({canvas}); }}")
     cg.add(var.set_canvas_getter(getter))
 
     # Set dimensions
