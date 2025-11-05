@@ -5,6 +5,7 @@
 #include "esphome/core/log.h"
 #include "esphome/components/network/util.h"
 #include <cstring>
+#include <strings.h>
 #include <algorithm>
 #include <cstdio>
 #include <cctype>
@@ -77,7 +78,26 @@ void MediaProxyOutput::set_hw(const std::string &hw) {
 }
 
 void MediaProxyOutput::set_format(const std::string &fmt) {
-  format_ = fmt;
+  uint8_t pixcfg;
+  if (strcasecmp(fmt.c_str(), "rgb888") == 0) {
+    pixcfg = ddp::DDP_PIXCFG_RGB888;
+  } else if (strcasecmp(fmt.c_str(), "rgb565le") == 0) {
+    pixcfg = ddp::DDP_PIXCFG_RGB565_LE;
+  } else if (strcasecmp(fmt.c_str(), "rgb565be") == 0) {
+    pixcfg = ddp::DDP_PIXCFG_RGB565_BE;
+  } else if (strcasecmp(fmt.c_str(), "rgbw") == 0) {
+    pixcfg = ddp::DDP_PIXCFG_RGBW;
+  } else if (strcasecmp(fmt.c_str(), "rgb565") == 0) {
+#if defined(LV_COLOR_16_SWAP) && LV_COLOR_16_SWAP
+    pixcfg = ddp::DDP_PIXCFG_RGB565_BE;
+#else
+    pixcfg = ddp::DDP_PIXCFG_RGB565_LE;
+#endif
+  } else {
+    pixcfg = ddp::DDP_PIXCFG_RGB888;  // fallback
+  }
+
+  format_pixcfg_ = pixcfg;
   if (parent_) {
     parent_->send_update(stream_id_);
   }
@@ -135,20 +155,9 @@ static std::string build_stream_json_(const char *type,
                                       const std::optional<bool> &loop,
                                       const std::optional<std::string> &hw,
                                       const std::optional<std::string> &fit) {
-  // Calculate accurate size: fixed structure + src + optional fields + margin
-  size_t estimated_size = 80 +                                    // fixed JSON structure
-                          src.length() + 10 +                     // "src":"..."
-                          (fmt ? 20 : 0) +                        // "fmt":"..."
-                          (pixcfg ? 13 : 0) +                     // "pixcfg":123
-                          (pace ? 15 : 0) +                       // "pace":12345
-                          (ema ? 18 : 0) +                        // "ema":1.234567
-                          (expand ? 14 : 0) +                     // "expand":123
-                          (loop ? 12 : 0) +                       // "loop":true
-                          (hw ? hw->length() + 10 : 0) +          // "hw":"..."
-                          (fit ? fit->length() + 11 : 0) +        // "fit":"..."
-                          32;                                     // safety margin
+  // Reserve: src (variable) + overhead for all JSON structure/fields
   std::string json;
-  json.reserve(estimated_size);
+  json.reserve(src.length() + 256);
   json += "{";
   append_json_str(json, "type", type);      json += ",";
   append_json_int(json, "out", stream_id);  json += ",";
@@ -189,19 +198,19 @@ static void log_stream_line_(const char *label,
   if (pace) {
     snprintf(pace_buf, sizeof(pace_buf), "%d", *pace);
   } else {
-    strcpy(pace_buf, "(unset)");
+    snprintf(pace_buf, sizeof(pace_buf), "%s", "(unset)");
   }
 
   if (ema) {
     snprintf(ema_buf, sizeof(ema_buf), "%.6f", *ema);
   } else {
-    strcpy(ema_buf, "(unset)");
+    snprintf(ema_buf, sizeof(ema_buf), "%s", "(unset)");
   }
 
   if (expand) {
     snprintf(expand_buf, sizeof(expand_buf), "%d", *expand);
   } else {
-    strcpy(expand_buf, "(unset)");
+    snprintf(expand_buf, sizeof(expand_buf), "%s", "(unset)");
   }
 
   ESP_LOGI(TAG, "tx %s stream=%u size=%dx%d src=%s ddp_port=%u fmt=%s pixcfg=0x%02X "
@@ -215,31 +224,6 @@ static void log_stream_line_(const char *label,
            (loop?(*loop?"true":"false"):"(unset)"),
            (hw?hw->c_str():"(unset)"),
            (fit?fit->c_str():"(unset)"));
-}
-
-// map format string -> ("fmt" field, pixcfg byte). For "rgb565" without endian,
-// we borrow endianness from the sink's LVGL (preferred_ddp_pixcfg()).
-static inline std::pair<std::string,uint8_t>
-resolve_fmt_and_pixcfg_(const std::string &fmt_in, ddp::DdpComponent *ddp) {
-  std::string f = fmt_in;
-  for (auto &c : f) c = (char)tolower((unsigned char)c);
-  if (f == "rgb888")
-    return { "rgb888", ddp::DDP_PIXCFG_RGB888 };
-  if (f == "rgb565le")
-    return { "rgb565le", ddp::DDP_PIXCFG_RGB565_LE };
-  if (f == "rgb565be")
-    return { "rgb565be", ddp::DDP_PIXCFG_RGB565_BE };
-  if (f == "rgbw")
-    return { "rgbw", ddp::DDP_PIXCFG_RGBW };
-  if (f == "rgb565") {
-#if defined(LV_COLOR_16_SWAP) && LV_COLOR_16_SWAP
-    return { "rgb565be", ddp::DDP_PIXCFG_RGB565_BE };
-#else
-    return { "rgb565le", ddp::DDP_PIXCFG_RGB565_LE };
-#endif
-  }
-  // fallback
-  return { "rgb888", ddp::DDP_PIXCFG_RGB888 };
 }
 
 // ------------- trampoline -------------
@@ -340,6 +324,17 @@ void MediaProxyControl::dump_config() {
     std::string ema_str = output->ema_ ? std::to_string(*output->ema_) : "(unset)";
     std::string expand_str = output->expand_ ? std::to_string(*output->expand_) : "(unset)";
 
+    const char* format_str = "(unset)";
+    if (output->format_pixcfg_) {
+      switch (*output->format_pixcfg_) {
+        case ddp::DDP_PIXCFG_RGB888: format_str = "rgb888"; break;
+        case ddp::DDP_PIXCFG_RGB565_LE: format_str = "rgb565le"; break;
+        case ddp::DDP_PIXCFG_RGB565_BE: format_str = "rgb565be"; break;
+        case ddp::DDP_PIXCFG_RGBW: format_str = "rgbw"; break;
+        default: format_str = "rgb888"; break;
+      }
+    }
+
     ESP_LOGCONFIG(TAG, "      src=%s pace=%s ema=%s expand=%s loop=%s hw=%s format=%s",
                   output->src_.c_str(),
                   pace_str.c_str(),
@@ -347,7 +342,7 @@ void MediaProxyControl::dump_config() {
                   expand_str.c_str(),
                   output->loop_ ? (*output->loop_ ? "true" : "false") : "(unset)",
                   output->hw_ ? output->hw_->c_str() : "(unset)",
-                  output->format_ ? output->format_->c_str() : "(unset)");
+                  format_str);
   }
 }
 
@@ -565,13 +560,10 @@ void MediaProxyControl::stop_stream(uint8_t stream_id) {
   }
 
   if (!client_ || !running_.load()) return;
-  std::string json;
-  json.reserve(48);
-  json += "{\"type\":\"stop_stream\",\"out\":";
-  json += std::to_string(stream_id);
-  json += "}";
+  char buf[64];
+  snprintf(buf, sizeof(buf), "{\"type\":\"stop_stream\",\"out\":%u}", (unsigned) stream_id);
   ESP_LOGI(TAG, "tx stop_stream stream=%u", (unsigned) stream_id);
-  this->send_text(json);
+  this->send_text(buf);
 }
 
 void MediaProxyControl::send_update(uint8_t stream_id) {
@@ -586,18 +578,15 @@ void MediaProxyControl::send_update(uint8_t stream_id) {
 std::string MediaProxyControl::json_escape_(const std::string &s) {
   std::string o; o.reserve(s.size()+8);
   for (char c: s) {
-    switch (c) {
-      case '\"': o += "\\\""; break;
-      case '\\': o += "\\\\"; break;
-      case '\b': o += "\\b"; break;
-      case '\f': o += "\\f"; break;
-      case '\n': o += "\\n"; break;
-      case '\r': o += "\\r"; break;
-      case '\t': o += "\\t"; break;
-      default:
-        if ((unsigned char)c < 0x20) { char buf[7]; snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c); o += buf; }
-        else o += c;
-    }
+    if (c == '\"') o += "\\\"";
+    else if (c == '\\') o += "\\\\";
+    else if (c == '\n') o += "\\n";
+    else if (c == '\t') o += "\\t";
+    else if (c == '\r') o += "\\r";
+    else if (c == '\b') o += "\\b";
+    else if (c == '\f') o += "\\f";
+    else if ((unsigned char)c < 0x20) { char buf[7]; snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c); o += buf; }
+    else o += c;
   }
   return o;
 }
@@ -638,10 +627,26 @@ MediaProxyControl::StreamConfig MediaProxyControl::compute_stream_config_(uint8_
   if (output && output->loop_) e.loop = *output->loop_;
 
   // format → (fmt,pixcfg)
-  if (output && output->format_) {
-    auto rp = resolve_fmt_and_pixcfg_(*output->format_, ddp_);
-    e.fmt = rp.first;
-    e.pixcfg = rp.second;
+  if (output && output->format_pixcfg_) {
+    e.pixcfg = *output->format_pixcfg_;
+    // Convert enum → string for JSON
+    switch (*output->format_pixcfg_) {
+      case ddp::DDP_PIXCFG_RGB888:
+        e.fmt = "rgb888";
+        break;
+      case ddp::DDP_PIXCFG_RGB565_LE:
+        e.fmt = "rgb565le";
+        break;
+      case ddp::DDP_PIXCFG_RGB565_BE:
+        e.fmt = "rgb565be";
+        break;
+      case ddp::DDP_PIXCFG_RGBW:
+        e.fmt = "rgbw";
+        break;
+      default:
+        e.fmt = "rgb888";
+        break;
+    }
   }
 
   // fit
