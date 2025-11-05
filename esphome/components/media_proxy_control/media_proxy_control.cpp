@@ -99,13 +99,17 @@ static inline void append_json_str(std::string &dst, const char *key, const std:
   dst += "\""; dst += key; dst += "\":\""; dst += val; dst += "\"";
 }
 static inline void append_json_int(std::string &dst, const char *key, long long v) {
-  dst += "\""; dst += key; dst += "\":"; dst += std::to_string(v);
+  char buf[64];
+  snprintf(buf, sizeof(buf), "\"%s\":%lld", key, v);
+  dst += buf;
 }
 static inline void append_json_float(std::string &dst, const char *key, double v) {
   char buf[64]; snprintf(buf, sizeof(buf), "\"%s\":%.6f", key, v); dst += buf;
 }
 static inline void append_json_bool(std::string &dst, const char *key, bool v) {
-  dst += "\""; dst += key; dst += "\":"; dst += (v ? "true" : "false");
+  char buf[64];
+  snprintf(buf, sizeof(buf), "\"%s\":%s", key, v ? "true" : "false");
+  dst += buf;
 }
 
 // Task to cleanup websocket client without blocking main thread
@@ -131,8 +135,20 @@ static std::string build_stream_json_(const char *type,
                                       const std::optional<bool> &loop,
                                       const std::optional<std::string> &hw,
                                       const std::optional<std::string> &fit) {
+  // Calculate accurate size: fixed structure + src + optional fields + margin
+  size_t estimated_size = 80 +                                    // fixed JSON structure
+                          src.length() + 10 +                     // "src":"..."
+                          (fmt ? 20 : 0) +                        // "fmt":"..."
+                          (pixcfg ? 13 : 0) +                     // "pixcfg":123
+                          (pace ? 15 : 0) +                       // "pace":12345
+                          (ema ? 18 : 0) +                        // "ema":1.234567
+                          (expand ? 14 : 0) +                     // "expand":123
+                          (loop ? 12 : 0) +                       // "loop":true
+                          (hw ? hw->length() + 10 : 0) +          // "hw":"..."
+                          (fit ? fit->length() + 11 : 0) +        // "fit":"..."
+                          32;                                     // safety margin
   std::string json;
-  json.reserve(256);
+  json.reserve(estimated_size);
   json += "{";
   append_json_str(json, "type", type);      json += ",";
   append_json_int(json, "out", stream_id);  json += ",";
@@ -166,18 +182,36 @@ static void log_stream_line_(const char *label,
                              const std::optional<bool> &loop,
                              const std::optional<std::string> &hw,
                              const std::optional<std::string> &fit) {
-  std::string pace_str = pace ? std::to_string(*pace) : "(unset)";
-  std::string ema_str = ema ? std::to_string(*ema) : "(unset)";
-  std::string expand_str = expand ? std::to_string(*expand) : "(unset)";
+  // Use stack buffers instead of heap-allocated strings to reduce memory usage
+  // Buffers persist through entire function scope, so c_str() usage is safe
+  char pace_buf[32], ema_buf[32], expand_buf[32];
+
+  if (pace) {
+    snprintf(pace_buf, sizeof(pace_buf), "%d", *pace);
+  } else {
+    strcpy(pace_buf, "(unset)");
+  }
+
+  if (ema) {
+    snprintf(ema_buf, sizeof(ema_buf), "%.6f", *ema);
+  } else {
+    strcpy(ema_buf, "(unset)");
+  }
+
+  if (expand) {
+    snprintf(expand_buf, sizeof(expand_buf), "%d", *expand);
+  } else {
+    strcpy(expand_buf, "(unset)");
+  }
 
   ESP_LOGI(TAG, "tx %s stream=%u size=%dx%d src=%s ddp_port=%u fmt=%s pixcfg=0x%02X "
                 "pace=%s ema=%s expand=%s loop=%s hw=%s fit=%s",
            label,
            (unsigned) stream_id, w, h, src.c_str(), (unsigned) ddp_port,
            (fmt?fmt->c_str():"(unset)"), (unsigned) (pixcfg?*pixcfg:0),
-           pace_str.c_str(),
-           ema_str.c_str(),
-           expand_str.c_str(),
+           pace_buf,
+           ema_buf,
+           expand_buf,
            (loop?(*loop?"true":"false"):"(unset)"),
            (hw?hw->c_str():"(unset)"),
            (fit?fit->c_str():"(unset)"));
