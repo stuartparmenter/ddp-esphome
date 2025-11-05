@@ -5,6 +5,7 @@
 
 #include "esphome/core/automation.h"
 #include "media_proxy_control.h"
+#include "esphome/core/version.h"
 
 namespace esphome {
 namespace media_proxy_control {
