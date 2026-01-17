@@ -8,7 +8,6 @@ ESPHome external components for streaming images/video to **LVGL** displays and 
 
 **📚 Documentation:**
 - [DDP Protocol Specification](http://www.3waylabs.com/ddp/) - Official DDP protocol documentation
-- [DDP mDNS Discovery Spec](DDP-MDNS-DISCOVERY.md) - Zero-configuration network discovery (our extension to DDP)
 
 ## Components
 

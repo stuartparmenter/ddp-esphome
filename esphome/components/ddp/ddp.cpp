@@ -71,9 +71,6 @@ void DdpComponent::setup() {
 
   this->set_interval("ddp_net", 500, [this]() { this->ensure_socket_(); });
 
-  // Register mDNS service for DDP discovery
-  this->register_mdns_service_();
-
   ESP_LOGI(TAG, "initialized; waiting for network to open UDP %u", this->port_);
 }
 
@@ -541,110 +538,6 @@ void DdpComponent::handle_pixel_data_(uint8_t stream_id, const DdpHeader* hdr,
   auto& m = metrics_[stream_id];
   m.frame_bytes_accum += len;
   m.frame_px_accum += pixel_count;
-#endif
-}
-
-// -------- mDNS service registration --------
-
-void DdpComponent::register_mdns_service_() {
-  if (mdns_registered_) return;
-
-#ifdef USE_ESP_IDF
-  // Build TXT records using ESP-IDF mDNS API
-  // The ESP-IDF mDNS library copies the TXT data, but we need stable pointers until the call completes
-  txt_storage_.clear();
-
-  // Pre-reserve space to prevent reallocation during building (which would invalidate pointers)
-  txt_storage_.reserve(32);  // Enough for static records + ~12 stream IDs with dimensions
-
-  std::vector<mdns_txt_item_t> txt_records;
-
-  // Static TXT records
-  txt_storage_.push_back("txtvers");
-  txt_storage_.push_back("1");
-  txt_storage_.push_back("protovers");
-  txt_storage_.push_back("1");
-  txt_storage_.push_back("fmts");
-  txt_storage_.push_back("rgb888,rgb565le,rgb565be,rgbw");
-
-  // Build TXT record array (pointers are now stable because we reserved space)
-  txt_records.push_back({const_cast<char*>(txt_storage_[0].c_str()),
-                         const_cast<char*>(txt_storage_[1].c_str())});
-  txt_records.push_back({const_cast<char*>(txt_storage_[2].c_str()),
-                         const_cast<char*>(txt_storage_[3].c_str())});
-  txt_records.push_back({const_cast<char*>(txt_storage_[4].c_str()),
-                         const_cast<char*>(txt_storage_[5].c_str())});
-
-  // Track where we are in txt_storage_ for building records
-  size_t storage_idx = 6;  // Start after the 6 static strings above
-
-  // Add registered stream IDs and dimensions
-  if (!renderers_.empty()) {
-    std::vector<uint8_t> stream_ids;
-
-    for (auto &kv : renderers_) {
-      uint8_t stream_id = kv.first;
-      stream_ids.push_back(stream_id);
-
-      // Get dimensions from first renderer with known dimensions
-      for (auto* renderer : kv.second) {
-        int w, h;
-        if (renderer->get_dimensions(&w, &h) && w > 0 && h > 0) {
-          // Allocate dynamic strings for id<N>=WxH TXT record
-          txt_storage_.push_back(std::string("id") + std::to_string(stream_id));
-          char buf[32];
-          snprintf(buf, sizeof(buf), "%dx%d", w, h);
-          txt_storage_.push_back(buf);
-
-          txt_records.push_back({
-            const_cast<char*>(txt_storage_[storage_idx].c_str()),
-            const_cast<char*>(txt_storage_[storage_idx + 1].c_str())
-          });
-          storage_idx += 2;
-          break;  // Only need one renderer's dimensions per stream
-        }
-      }
-    }
-
-    // Build comma-separated list of stream IDs
-    if (!stream_ids.empty()) {
-      std::sort(stream_ids.begin(), stream_ids.end());
-      std::string ids_str;
-      for (size_t i = 0; i < stream_ids.size(); ++i) {
-        if (i > 0) ids_str += ",";
-        ids_str += std::to_string(stream_ids[i]);
-      }
-      txt_storage_.push_back("ids");
-      txt_storage_.push_back(ids_str);
-      txt_records.push_back({
-        const_cast<char*>(txt_storage_[storage_idx].c_str()),
-        const_cast<char*>(txt_storage_[storage_idx + 1].c_str())
-      });
-      storage_idx += 2;  // Not strictly needed but keeps pattern consistent
-    }
-  }
-
-  // Debug: Log TXT records before registration
-  ESP_LOGD(TAG, "Registering mDNS service with %zu TXT records:", txt_records.size());
-  for (size_t i = 0; i < txt_records.size(); i++) {
-    ESP_LOGD(TAG, "  [%zu] %s = %s", i,
-             txt_records[i].key ? txt_records[i].key : "NULL",
-             txt_records[i].value ? txt_records[i].value : "NULL");
-  }
-
-  // Register service with ESP-IDF mDNS
-  esp_err_t err = mdns_service_add(NULL, "_ddp", "_udp", port_,
-                                    txt_records.data(), txt_records.size());
-  if (err != ESP_OK) {
-    ESP_LOGW(TAG, "Failed to register mDNS service: %s", esp_err_to_name(err));
-    return;
-  }
-
-  mdns_registered_ = true;
-  ESP_LOGI(TAG, "Registered mDNS service _ddp._udp on port %u with %zu TXT records",
-           port_, txt_records.size());
-#else
-  ESP_LOGW(TAG, "mDNS service registration requires ESP-IDF platform");
 #endif
 }
 
