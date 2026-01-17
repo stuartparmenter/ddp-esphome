@@ -6,10 +6,6 @@
 #include "esphome/core/component.h"
 #include "ddp_renderer.h"
 
-#ifdef USE_ESP_IDF
-#include <mdns.h>
-#endif
-
 #include <map>
 #include <set>
 #include <vector>
@@ -106,11 +102,6 @@ class DdpComponent : public Component {
 
   // Renderer registry: stream_id → set<DdpRenderer*>
   std::map<uint8_t, std::set<DdpRenderer*>> renderers_;
-
-  // mDNS service registration (uses ESP-IDF mDNS API directly)
-  bool mdns_registered_{false};
-  void register_mdns_service_();
-  std::vector<std::string> txt_storage_;  // Persistent storage for mDNS TXT record strings
 
 #if DDP_METRICS
   // Per-stream metrics
