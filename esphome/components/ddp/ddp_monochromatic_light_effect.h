@@ -1,4 +1,4 @@
-// © Copyright 2025 Stuart Parmenter
+// © Copyright 2026 Stuart Parmenter
 // SPDX-License-Identifier: MIT
 
 #pragma once
