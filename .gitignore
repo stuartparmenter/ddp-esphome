@@ -31,7 +31,6 @@ build/
 .venv*/
 env/
 env*/
-uv.lock
 .pytest_cache/
 .mypy_cache/
 .coverage
