@@ -11,8 +11,7 @@
 #include <algorithm>
 #include <type_traits>
 
-namespace esphome {
-namespace ddp {
+namespace esphome::ddp {
 
 static const char *TAG = "ddp.light_effect";
 
@@ -163,5 +162,4 @@ void DdpLightEffect::apply(light::AddressableLight &it, const Color &current_col
   it.schedule_show();
 }
 
-}  // namespace ddp
-}  // namespace esphome
+}  // namespace esphome::ddp

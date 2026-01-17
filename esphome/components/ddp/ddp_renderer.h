@@ -5,8 +5,7 @@
 
 #include <cstdint>
 
-namespace esphome {
-namespace ddp {
+namespace esphome::ddp {
 
 // Pixel format enumeration
 enum class PixelFormat {
@@ -86,5 +85,4 @@ class DdpRenderer {
 #endif
 };
 
-}  // namespace ddp
-}  // namespace esphome
+}  // namespace esphome::ddp

@@ -12,8 +12,7 @@
 #include <vector>
 #include <atomic>
 
-namespace esphome {
-namespace ddp {
+namespace esphome::ddp {
 
 // DDP renderer that outputs to AddressableLight as an effect (like E1.31)
 class DdpLightEffect : public light::AddressableLightEffect, public DdpRenderer {
@@ -53,5 +52,4 @@ class DdpLightEffect : public light::AddressableLightEffect, public DdpRenderer 
   RAMAllocator<uint8_t> allocator_;
 };
 
-}  // namespace ddp
-}  // namespace esphome
+}  // namespace esphome::ddp

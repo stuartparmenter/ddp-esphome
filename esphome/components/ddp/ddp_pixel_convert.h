@@ -12,8 +12,7 @@
 #include <cstdint>
 #include <cstddef>
 
-namespace esphome {
-namespace ddp {
+namespace esphome::ddp {
 
 // RGB to RGBW white channel conversion modes (internal use only)
 enum class RGBWMode : uint8_t {
@@ -441,5 +440,4 @@ inline void convert_rgbw_to_brightness(uint8_t *dst, const uint8_t *src, size_t 
   }
 }
 
-}  // namespace ddp
-}  // namespace esphome
+}  // namespace esphome::ddp
