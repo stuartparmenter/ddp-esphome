@@ -13,8 +13,7 @@
 #include "esp_timer.h"
 #include <sys/time.h>
 
-namespace esphome {
-namespace ddp {
+namespace esphome::ddp {
 
 static const char* TAG = "ddp";
 
@@ -541,5 +540,4 @@ void DdpComponent::handle_pixel_data_(uint8_t stream_id, const DdpHeader* hdr,
 #endif
 }
 
-} // namespace ddp
-} // namespace esphome
+}  // namespace esphome::ddp
