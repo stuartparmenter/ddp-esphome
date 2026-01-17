@@ -102,6 +102,7 @@ async def to_code(config):
     # Enable wake_loop_threadsafe for low-latency wakeup (ESPHome 2025.11+)
     try:
         from esphome.components import socket
+
         socket.require_wake_loop_threadsafe()
     except AttributeError:
         # Backward compatibility: not available in older ESPHome
