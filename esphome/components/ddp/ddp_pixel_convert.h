@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstddef>
@@ -91,6 +92,28 @@ static_assert(detail::LUT_G6_ARRAY[0x00] == 0x0000, "G6 LUT: black incorrect");
 static_assert(detail::LUT_G6_ARRAY[0xFC] == 0x07E0, "G6 LUT: max green incorrect");
 static_assert(detail::LUT_B5_ARRAY[0x00] == 0x0000, "B5 LUT: black incorrect");
 static_assert(detail::LUT_B5_ARRAY[0xF8] == 0x001F, "B5 LUT: max blue incorrect");
+
+// RGB565 to RGB888 expansion helper
+// Reads a 16-bit RGB565 value with endianness handling and expands to 8-bit RGB
+// Safe to call from UDP task (pure math, no allocations or API calls)
+//
+// sp: Pointer to 2 bytes of RGB565 data
+// big_endian: If true, source is RGB565 big-endian; if false, little-endian
+// r, g, b: Output RGB888 values (modified in-place)
+constexpr void expand_rgb565_to_rgb888(const uint8_t *sp, bool big_endian, uint8_t &r, uint8_t &g, uint8_t &b) noexcept {
+  // Read RGB565 value (handle endianness)
+  uint16_t v = big_endian ? (uint16_t) ((sp[0] << 8) | sp[1]) : (uint16_t) ((sp[1] << 8) | sp[0]);
+
+  // Extract 5/6/5 bit components
+  uint8_t r5 = (uint8_t) ((v >> 11) & 0x1F);
+  uint8_t g6 = (uint8_t) ((v >> 5) & 0x3F);
+  uint8_t b5 = (uint8_t) (v & 0x1F);
+
+  // Expand to 8-bit (scale + replicate MSBs into LSBs)
+  r = (uint8_t) ((r5 << 3) | (r5 >> 2));
+  g = (uint8_t) ((g6 << 2) | (g6 >> 4));
+  b = (uint8_t) ((b5 << 3) | (b5 >> 2));
+}
 
 // Convert RGB888 to RGB565 with optional byte swap
 // Safe to call from UDP task (pure math, no allocations or API calls)
@@ -291,18 +314,8 @@ inline void convert_rgb565_to_rgbw(uint8_t *dst, const uint8_t *src, size_t pixe
   const uint8_t *sp = src;
 
   for (size_t i = 0; i < pixel_count; ++i) {
-    // Extract RGB565 value (handle endianness)
-    uint16_t v = src_big_endian ? (uint16_t) ((sp[0] << 8) | sp[1]) : (uint16_t) ((sp[1] << 8) | sp[0]);
-
-    // Extract 5/6/5 bit components
-    uint8_t r5 = (uint8_t) ((v >> 11) & 0x1F);
-    uint8_t g6 = (uint8_t) ((v >> 5) & 0x3F);
-    uint8_t b5 = (uint8_t) (v & 0x1F);
-
-    // Expand to 8-bit (scale + replicate MSBs into LSBs)
-    uint8_t r = (uint8_t) ((r5 << 3) | (r5 >> 2));
-    uint8_t g = (uint8_t) ((g6 << 2) | (g6 >> 4));
-    uint8_t b = (uint8_t) ((b5 << 3) | (b5 >> 2));
+    uint8_t r, g, b;
+    expand_rgb565_to_rgb888(sp, src_big_endian, r, g, b);
 
     if (mode == RGBWMode::ACCURATE) {
       // Extract white and reduce RGB
@@ -324,10 +337,12 @@ inline void convert_rgb565_to_rgbw(uint8_t *dst, const uint8_t *src, size_t pixe
 
 // Convert a single RGB pixel to brightness using the specified method
 // Safe to call from UDP task (pure math, no allocations or API calls)
-inline uint8_t rgb_to_brightness(uint8_t r, uint8_t g, uint8_t b, BrightnessMethod method) noexcept {
+// constexpr: allows compile-time evaluation when inputs are known
+// [[gnu::const]]: result depends only on arguments, enabling aggressive optimization
+[[gnu::const]] constexpr uint8_t rgb_to_brightness(uint8_t r, uint8_t g, uint8_t b, BrightnessMethod method) noexcept {
   switch (method) {
     case BrightnessMethod::MAX:
-      return r > g ? (r > b ? r : b) : (g > b ? g : b);
+      return std::max({r, g, b});
     case BrightnessMethod::AVERAGE:
       return static_cast<uint8_t>((static_cast<uint16_t>(r) + g + b) / 3);
     case BrightnessMethod::LUMINANCE:
@@ -382,18 +397,8 @@ inline void convert_rgb565_to_brightness(uint8_t *dst, const uint8_t *src, size_
   const uint8_t *sp = src;
 
   for (size_t i = 0; i < pixel_count; ++i) {
-    // Extract RGB565 value (handle endianness)
-    uint16_t v = src_big_endian ? (uint16_t) ((sp[0] << 8) | sp[1]) : (uint16_t) ((sp[1] << 8) | sp[0]);
-
-    // Extract 5/6/5 bit components
-    uint8_t r5 = (uint8_t) ((v >> 11) & 0x1F);
-    uint8_t g6 = (uint8_t) ((v >> 5) & 0x3F);
-    uint8_t b5 = (uint8_t) (v & 0x1F);
-
-    // Expand to 8-bit (scale + replicate MSBs into LSBs)
-    uint8_t r = (uint8_t) ((r5 << 3) | (r5 >> 2));
-    uint8_t g = (uint8_t) ((g6 << 2) | (g6 >> 4));
-    uint8_t b = (uint8_t) ((b5 << 3) | (b5 >> 2));
+    uint8_t r, g, b;
+    expand_rgb565_to_rgb888(sp, src_big_endian, r, g, b);
 
     uint8_t brightness = rgb_to_brightness(r, g, b, method);
     dst[i * 4 + 0] = brightness;  // R
