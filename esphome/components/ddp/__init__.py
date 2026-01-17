@@ -14,11 +14,20 @@ AUTO_LOAD = ["light"]
 ddp_ns = cg.esphome_ns.namespace("ddp")
 DdpComponent = ddp_ns.class_("DdpComponent", cg.Component)
 DdpLightEffect = ddp_ns.class_("DdpLightEffect", AddressableLightEffect)
+BrightnessMethod = ddp_ns.enum("BrightnessMethod")
 
 # Configuration keys
 CONF_DDP_ID = "ddp_id"
 CONF_STREAM = "stream"
 CONF_METRICS = "metrics"
+CONF_BRIGHTNESS_METHOD = "brightness_method"
+
+# Brightness method enum values
+BRIGHTNESS_METHODS = {
+    "max": BrightnessMethod.MAX,
+    "average": BrightnessMethod.AVERAGE,
+    "luminance": BrightnessMethod.LUMINANCE,
+}
 
 # Shared stream ID registry (used by ddp_canvas and ddp_light_effect)
 _used_stream_ids = set()
@@ -105,6 +114,9 @@ async def to_code(config):
         cv.Optional(CONF_STREAM): cv.int_range(
             min=1, max=249
         ),  # Optional - auto-generates if not specified
+        cv.Optional(CONF_BRIGHTNESS_METHOD, default="max"): cv.enum(
+            BRIGHTNESS_METHODS, lower=True
+        ),  # RGB to brightness conversion method for monochromatic lights
     },
 )
 async def ddp_light_effect_to_code(config, effect_id):
@@ -121,6 +133,7 @@ async def ddp_light_effect_to_code(config, effect_id):
     effect = cg.new_Pvariable(effect_id, config[CONF_NAME])
     cg.add(effect.set_parent(parent))
     cg.add(effect.set_stream_id(stream_id))
+    cg.add(effect.set_brightness_method(config[CONF_BRIGHTNESS_METHOD]))
 
     # Register with parent DDP component
     cg.add(parent.register_renderer(effect))

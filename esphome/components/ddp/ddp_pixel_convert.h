@@ -20,6 +20,13 @@ enum class RGBWMode : uint8_t {
   ACCURATE = 1,  // Extract white, reduce RGB (for RGBW strips)
 };
 
+// RGB to brightness conversion methods (for monochromatic lights)
+enum class BrightnessMethod : uint8_t {
+  MAX = 0,        // max(R, G, B) - preserves peak brightness
+  AVERAGE = 1,    // (R + G + B) / 3 - simple average
+  LUMINANCE = 2,  // 0.299R + 0.587G + 0.114B - perceptual brightness (Rec. 601)
+};
+
 // RGB565 conversion lookup tables (compile-time generated, C++20 constexpr)
 // Used for fast RGB888 → RGB565 conversion
 //
@@ -312,6 +319,120 @@ inline void convert_rgb565_to_rgbw(uint8_t *dst, const uint8_t *src, size_t pixe
       dst[i * 4 + 3] = 0;  // W = 0
     }
     sp += 2;
+  }
+}
+
+// Convert a single RGB pixel to brightness using the specified method
+// Safe to call from UDP task (pure math, no allocations or API calls)
+inline uint8_t rgb_to_brightness(uint8_t r, uint8_t g, uint8_t b, BrightnessMethod method) noexcept {
+  switch (method) {
+    case BrightnessMethod::MAX:
+      return r > g ? (r > b ? r : b) : (g > b ? g : b);
+    case BrightnessMethod::AVERAGE:
+      return static_cast<uint8_t>((static_cast<uint16_t>(r) + g + b) / 3);
+    case BrightnessMethod::LUMINANCE:
+    default:
+      // Rec. 601 luminance: 0.299R + 0.587G + 0.114B
+      // Using fixed-point: (77*R + 150*G + 29*B) >> 8
+      return static_cast<uint8_t>((77 * r + 150 * g + 29 * b) >> 8);
+  }
+}
+
+// Convert RGB888 to brightness (monochromatic output as grayscale RGBW)
+// Safe to call from UDP task (pure math, no allocations or API calls)
+//
+// dst: Destination buffer for RGBW pixels (must be pre-allocated, 4 bytes per pixel)
+// src: Source RGB888 data (3 bytes per pixel: R, G, B)
+// pixel_count: Number of pixels to convert
+// method: Brightness conversion method
+//
+// Output: R=G=B=brightness, W=0 (grayscale)
+inline void convert_rgb888_to_brightness(uint8_t *dst, const uint8_t *src, size_t pixel_count,
+                                         BrightnessMethod method) noexcept {
+  if (!dst || !src)
+    return;
+
+  const uint8_t *sp = src;
+
+  for (size_t i = 0; i < pixel_count; ++i) {
+    uint8_t brightness = rgb_to_brightness(sp[0], sp[1], sp[2], method);
+    dst[i * 4 + 0] = brightness;  // R
+    dst[i * 4 + 1] = brightness;  // G
+    dst[i * 4 + 2] = brightness;  // B
+    dst[i * 4 + 3] = 0;           // W = 0
+    sp += 3;
+  }
+}
+
+// Convert RGB565 to brightness (monochromatic output as grayscale RGBW)
+// Safe to call from UDP task (pure math, no allocations or API calls)
+//
+// dst: Destination buffer for RGBW pixels (must be pre-allocated, 4 bytes per pixel)
+// src: Source RGB565 data (2 bytes per pixel)
+// pixel_count: Number of pixels to convert
+// src_big_endian: If true, source is RGB565 big-endian; if false, little-endian
+// method: Brightness conversion method
+//
+// Output: R=G=B=brightness, W=0 (grayscale)
+inline void convert_rgb565_to_brightness(uint8_t *dst, const uint8_t *src, size_t pixel_count, bool src_big_endian,
+                                         BrightnessMethod method) noexcept {
+  if (!dst || !src)
+    return;
+
+  const uint8_t *sp = src;
+
+  for (size_t i = 0; i < pixel_count; ++i) {
+    // Extract RGB565 value (handle endianness)
+    uint16_t v = src_big_endian ? (uint16_t) ((sp[0] << 8) | sp[1]) : (uint16_t) ((sp[1] << 8) | sp[0]);
+
+    // Extract 5/6/5 bit components
+    uint8_t r5 = (uint8_t) ((v >> 11) & 0x1F);
+    uint8_t g6 = (uint8_t) ((v >> 5) & 0x3F);
+    uint8_t b5 = (uint8_t) (v & 0x1F);
+
+    // Expand to 8-bit (scale + replicate MSBs into LSBs)
+    uint8_t r = (uint8_t) ((r5 << 3) | (r5 >> 2));
+    uint8_t g = (uint8_t) ((g6 << 2) | (g6 >> 4));
+    uint8_t b = (uint8_t) ((b5 << 3) | (b5 >> 2));
+
+    uint8_t brightness = rgb_to_brightness(r, g, b, method);
+    dst[i * 4 + 0] = brightness;  // R
+    dst[i * 4 + 1] = brightness;  // G
+    dst[i * 4 + 2] = brightness;  // B
+    dst[i * 4 + 3] = 0;           // W = 0
+    sp += 2;
+  }
+}
+
+// Convert RGBW to brightness (monochromatic output as grayscale RGBW)
+// Safe to call from UDP task (pure math, no allocations or API calls)
+//
+// dst: Destination buffer for RGBW pixels (must be pre-allocated, 4 bytes per pixel)
+// src: Source RGBW data (4 bytes per pixel: R, G, B, W)
+// pixel_count: Number of pixels to convert
+// method: Brightness conversion method
+//
+// Output: R=G=B=brightness, W=0 (grayscale)
+// Note: The W channel from input is added to the computed RGB brightness
+inline void convert_rgbw_to_brightness(uint8_t *dst, const uint8_t *src, size_t pixel_count,
+                                       BrightnessMethod method) noexcept {
+  if (!dst || !src)
+    return;
+
+  const uint8_t *sp = src;
+
+  for (size_t i = 0; i < pixel_count; ++i) {
+    // Compute brightness from RGB channels
+    uint8_t rgb_brightness = rgb_to_brightness(sp[0], sp[1], sp[2], method);
+    // Add white channel contribution (clamped to 255)
+    uint16_t total = static_cast<uint16_t>(rgb_brightness) + sp[3];
+    uint8_t brightness = total > 255 ? 255 : static_cast<uint8_t>(total);
+
+    dst[i * 4 + 0] = brightness;  // R
+    dst[i * 4 + 1] = brightness;  // G
+    dst[i * 4 + 2] = brightness;  // B
+    dst[i * 4 + 3] = 0;           // W = 0
+    sp += 4;
   }
 }
 

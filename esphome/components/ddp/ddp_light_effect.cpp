@@ -14,11 +14,10 @@
 namespace esphome {
 namespace ddp {
 
-static const char* TAG = "ddp.light_effect";
+static const char *TAG = "ddp.light_effect";
 
 // Helper to extract const char* from either std::string or const char*
-template<typename T>
-static inline const char* get_cstr(const T& val) {
+template<typename T> static inline const char *get_cstr(const T &val) {
   if constexpr (std::is_pointer_v<T>) {
     return val;  // Already const char*
   } else {
@@ -28,8 +27,7 @@ static inline const char* get_cstr(const T& val) {
 
 // -------- DdpRenderer interface (UDP TASK CONTEXT) --------
 
-void DdpLightEffect::on_data(size_t offset_px, const uint8_t* pixels,
-                              PixelFormat format, size_t pixel_count) {
+void DdpLightEffect::on_data(size_t offset_px, const uint8_t *pixels, PixelFormat format, size_t pixel_count) {
   // UDP TASK CONTEXT - no ESPHome APIs allowed!
 
   // Allocate buffer if not yet initialized
@@ -42,31 +40,44 @@ void DdpLightEffect::on_data(size_t offset_px, const uint8_t* pixels,
     std::memset(frame_buffer_, 0, frame_pixels_ * 4);
   }
 
-  if (!frame_buffer_ || frame_pixels_ == 0) return;
+  if (!frame_buffer_ || frame_pixels_ == 0)
+    return;
 
   // Bounds check
   if (offset_px + pixel_count > frame_pixels_) {
     return;  // Silently drop out-of-bounds data
   }
 
-  uint8_t* dst_rgbw = frame_buffer_ + (offset_px * 4);
-
-  // Determine RGBW conversion mode based on strip capability
-  RGBWMode mode = supports_white_ ? RGBWMode::ACCURATE : RGBWMode::NONE;
+  uint8_t *dst_rgbw = frame_buffer_ + (offset_px * 4);
 
   // Convert all formats to RGBW on arrival (single conversion)
-  if (format == PixelFormat::RGBW) {
-    // Direct copy - already RGBW
-    std::memcpy(dst_rgbw, pixels, pixel_count * 4);
+  // Use different conversion path for monochromatic vs color lights
+  if (is_monochromatic_) {
+    // Monochromatic light: convert RGB to brightness (grayscale)
+    if (format == PixelFormat::RGBW) {
+      convert_rgbw_to_brightness(dst_rgbw, pixels, pixel_count, brightness_method_);
+    } else if (format == PixelFormat::RGB888) {
+      convert_rgb888_to_brightness(dst_rgbw, pixels, pixel_count, brightness_method_);
+    } else if (format == PixelFormat::RGB565_BE || format == PixelFormat::RGB565_LE) {
+      const bool src_big_endian = (format == PixelFormat::RGB565_BE);
+      convert_rgb565_to_brightness(dst_rgbw, pixels, pixel_count, src_big_endian, brightness_method_);
+    }
+  } else {
+    // Color light: convert to RGBW
+    // Determine RGBW conversion mode based on strip capability
+    RGBWMode mode = supports_white_ ? RGBWMode::ACCURATE : RGBWMode::NONE;
 
-  } else if (format == PixelFormat::RGB888) {
-    // RGB888 → RGBW (mode-based: ACCURATE for RGBW strips, NONE for RGB strips)
-    convert_rgb888_to_rgbw(dst_rgbw, pixels, pixel_count, mode);
-
-  } else if (format == PixelFormat::RGB565_BE || format == PixelFormat::RGB565_LE) {
-    // RGB565 → RGBW (mode-based: ACCURATE for RGBW strips, NONE for RGB strips)
-    const bool src_big_endian = (format == PixelFormat::RGB565_BE);
-    convert_rgb565_to_rgbw(dst_rgbw, pixels, pixel_count, src_big_endian, mode);
+    if (format == PixelFormat::RGBW) {
+      // Direct copy - already RGBW
+      std::memcpy(dst_rgbw, pixels, pixel_count * 4);
+    } else if (format == PixelFormat::RGB888) {
+      // RGB888 → RGBW (mode-based: ACCURATE for RGBW strips, NONE for RGB strips)
+      convert_rgb888_to_rgbw(dst_rgbw, pixels, pixel_count, mode);
+    } else if (format == PixelFormat::RGB565_BE || format == PixelFormat::RGB565_LE) {
+      // RGB565 → RGBW (mode-based: ACCURATE for RGBW strips, NONE for RGB strips)
+      const bool src_big_endian = (format == PixelFormat::RGB565_BE);
+      convert_rgb565_to_rgbw(dst_rgbw, pixels, pixel_count, src_big_endian, mode);
+    }
   }
 }
 
@@ -75,19 +86,21 @@ void DdpLightEffect::on_push() {
   frame_ready_.store(true, std::memory_order_release);
 }
 
-bool DdpLightEffect::get_dimensions(int* w, int* h) const {
+bool DdpLightEffect::get_dimensions(int *w, int *h) const {
   // LED strips are 1D: report as num_leds × 1
-  auto* it = get_addressable_();
+  auto *it = get_addressable_();
   if (it) {
-    if (w) *w = it->size();
-    if (h) *h = 1;
+    if (w)
+      *w = it->size();
+    if (h)
+      *h = 1;
     return true;
   }
 
   return false;
 }
 
-const char* DdpLightEffect::get_name() const {
+const char *DdpLightEffect::get_name() const {
   // Access base class name_ member directly (protected)
   // Old ESPHome: name_ is std::string, call .c_str()
   // New ESPHome (PR #11487): name_ is const char*, return directly
@@ -105,19 +118,27 @@ void DdpLightEffect::start() {
   // Calculate frame buffer size from LED count
   int num_leds = 0;
   if (get_dimensions(&num_leds, nullptr)) {
-    frame_pixels_ = (size_t)num_leds;
+    frame_pixels_ = (size_t) num_leds;
   }
 
-  // Detect strip capability for white channel
+  // Detect strip capability for white channel and monochromatic mode
   auto *it = get_addressable_();
   if (it) {
     auto traits = it->get_traits();
     supports_white_ = traits.supports_color_mode(light::ColorMode::RGB_WHITE);
-    ESP_LOGI(TAG, "Started DDP light effect '%s' for stream %u (%d LEDs, %s strip)",
-             get_name(), stream_id_, num_leds, supports_white_ ? "RGBW" : "RGB");
+
+    // Check if this is a monochromatic (brightness-only) light
+    // A light is monochromatic if it supports BRIGHTNESS but not RGB or RGB_WHITE
+    bool supports_rgb = traits.supports_color_mode(light::ColorMode::RGB);
+    bool supports_rgb_white = traits.supports_color_mode(light::ColorMode::RGB_WHITE);
+    is_monochromatic_ =
+        traits.supports_color_mode(light::ColorMode::BRIGHTNESS) && !supports_rgb && !supports_rgb_white;
+
+    const char *strip_type = is_monochromatic_ ? "monochromatic" : (supports_white_ ? "RGBW" : "RGB");
+    ESP_LOGI(TAG, "Started DDP light effect '%s' for stream %u (%d LEDs, %s strip)", get_name(), stream_id_, num_leds,
+             strip_type);
   } else {
-    ESP_LOGI(TAG, "Started DDP light effect '%s' for stream %u (%d LEDs)",
-             get_name(), stream_id_, num_leds);
+    ESP_LOGI(TAG, "Started DDP light effect '%s' for stream %u (%d LEDs)", get_name(), stream_id_, num_leds);
   }
 }
 
@@ -134,7 +155,7 @@ void DdpLightEffect::stop() {
   AddressableLightEffect::stop();
 }
 
-void DdpLightEffect::apply(light::AddressableLight& it, const Color& current_color) {
+void DdpLightEffect::apply(light::AddressableLight &it, const Color &current_color) {
   // MAIN THREAD CONTEXT - safe to call ESPHome APIs
 
   // Check if we have a frame ready
@@ -142,21 +163,22 @@ void DdpLightEffect::apply(light::AddressableLight& it, const Color& current_col
     return;
   }
 
-  if (!frame_buffer_ || frame_pixels_ == 0) return;
+  if (!frame_buffer_ || frame_pixels_ == 0)
+    return;
 
   // Get LED count
   int num_leds = it.size();
 
   // Limit to available LEDs
-  size_t leds_to_set = std::min((size_t)num_leds, frame_pixels_);
+  size_t leds_to_set = std::min((size_t) num_leds, frame_pixels_);
 
   // Apply RGBW pixels directly (buffer is always RGBW after on_data conversion)
-  const uint8_t* data = frame_buffer_;
+  const uint8_t *data = frame_buffer_;
   for (size_t i = 0; i < leds_to_set; i++) {
-    it[i] = Color(data[i * 4 + 0],  // R
-                  data[i * 4 + 1],  // G
-                  data[i * 4 + 2],  // B
-                  data[i * 4 + 3]); // W
+    it[i] = Color(data[i * 4 + 0],   // R
+                  data[i * 4 + 1],   // G
+                  data[i * 4 + 2],   // B
+                  data[i * 4 + 3]);  // W
   }
 
   // Schedule LED update
