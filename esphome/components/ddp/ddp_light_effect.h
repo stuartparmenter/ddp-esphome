@@ -8,7 +8,6 @@
 #include "esphome/components/light/addressable_light_effect.h"
 #include "ddp.h"
 #include "ddp_renderer.h"
-#include "ddp_pixel_convert.h"
 
 #include <vector>
 #include <atomic>
@@ -24,7 +23,6 @@ class DdpLightEffect : public light::AddressableLightEffect, public DdpRenderer 
   // Configuration
   void set_parent(DdpComponent *parent) { parent_ = parent; }
   void set_stream_id(uint8_t id) { stream_id_ = id; }
-  void set_brightness_method(BrightnessMethod method) { brightness_method_ = method; }
 
   // DdpRenderer interface (UDP TASK CONTEXT)
   void on_data(size_t offset_px, const uint8_t *pixels, PixelFormat format, size_t pixel_count) override;
@@ -49,11 +47,7 @@ class DdpLightEffect : public light::AddressableLightEffect, public DdpRenderer 
   std::atomic<bool> frame_ready_{false};  // True when frame is ready to apply()
 
   // Light capability detection (set in start())
-  bool supports_white_{false};    // True if strip supports ColorMode::RGB_WHITE
-  bool is_monochromatic_{false};  // True if strip only supports ColorMode::BRIGHTNESS
-
-  // Brightness conversion method (for monochromatic lights)
-  BrightnessMethod brightness_method_{BrightnessMethod::MAX};
+  bool supports_white_{false};  // True if strip supports ColorMode::RGB_WHITE
 
   // Allocator for frame buffer (tries PSRAM first, falls back to internal RAM)
   RAMAllocator<uint8_t> allocator_;

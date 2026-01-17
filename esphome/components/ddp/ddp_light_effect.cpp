@@ -51,33 +51,19 @@ void DdpLightEffect::on_data(size_t offset_px, const uint8_t *pixels, PixelForma
   uint8_t *dst_rgbw = frame_buffer_ + (offset_px * 4);
 
   // Convert all formats to RGBW on arrival (single conversion)
-  // Use different conversion path for monochromatic vs color lights
-  if (is_monochromatic_) {
-    // Monochromatic light: convert RGB to brightness (grayscale)
-    if (format == PixelFormat::RGBW) {
-      convert_rgbw_to_brightness(dst_rgbw, pixels, pixel_count, brightness_method_);
-    } else if (format == PixelFormat::RGB888) {
-      convert_rgb888_to_brightness(dst_rgbw, pixels, pixel_count, brightness_method_);
-    } else if (format == PixelFormat::RGB565_BE || format == PixelFormat::RGB565_LE) {
-      const bool src_big_endian = (format == PixelFormat::RGB565_BE);
-      convert_rgb565_to_brightness(dst_rgbw, pixels, pixel_count, src_big_endian, brightness_method_);
-    }
-  } else {
-    // Color light: convert to RGBW
-    // Determine RGBW conversion mode based on strip capability
-    RGBWMode mode = supports_white_ ? RGBWMode::ACCURATE : RGBWMode::NONE;
+  // Determine RGBW conversion mode based on strip capability
+  RGBWMode mode = supports_white_ ? RGBWMode::ACCURATE : RGBWMode::NONE;
 
-    if (format == PixelFormat::RGBW) {
-      // Direct copy - already RGBW
-      std::memcpy(dst_rgbw, pixels, pixel_count * 4);
-    } else if (format == PixelFormat::RGB888) {
-      // RGB888 → RGBW (mode-based: ACCURATE for RGBW strips, NONE for RGB strips)
-      convert_rgb888_to_rgbw(dst_rgbw, pixels, pixel_count, mode);
-    } else if (format == PixelFormat::RGB565_BE || format == PixelFormat::RGB565_LE) {
-      // RGB565 → RGBW (mode-based: ACCURATE for RGBW strips, NONE for RGB strips)
-      const bool src_big_endian = (format == PixelFormat::RGB565_BE);
-      convert_rgb565_to_rgbw(dst_rgbw, pixels, pixel_count, src_big_endian, mode);
-    }
+  if (format == PixelFormat::RGBW) {
+    // Direct copy - already RGBW
+    std::memcpy(dst_rgbw, pixels, pixel_count * 4);
+  } else if (format == PixelFormat::RGB888) {
+    // RGB888 → RGBW (mode-based: ACCURATE for RGBW strips, NONE for RGB strips)
+    convert_rgb888_to_rgbw(dst_rgbw, pixels, pixel_count, mode);
+  } else if (format == PixelFormat::RGB565_BE || format == PixelFormat::RGB565_LE) {
+    // RGB565 → RGBW (mode-based: ACCURATE for RGBW strips, NONE for RGB strips)
+    const bool src_big_endian = (format == PixelFormat::RGB565_BE);
+    convert_rgb565_to_rgbw(dst_rgbw, pixels, pixel_count, src_big_endian, mode);
   }
 }
 
@@ -121,22 +107,14 @@ void DdpLightEffect::start() {
     frame_pixels_ = (size_t) num_leds;
   }
 
-  // Detect strip capability for white channel and monochromatic mode
+  // Detect strip capability for white channel
   auto *it = get_addressable_();
   if (it) {
     auto traits = it->get_traits();
     supports_white_ = traits.supports_color_mode(light::ColorMode::RGB_WHITE);
 
-    // Check if this is a monochromatic (brightness-only) light
-    // A light is monochromatic if it supports BRIGHTNESS but not RGB or RGB_WHITE
-    bool supports_rgb = traits.supports_color_mode(light::ColorMode::RGB);
-    bool supports_rgb_white = traits.supports_color_mode(light::ColorMode::RGB_WHITE);
-    is_monochromatic_ =
-        traits.supports_color_mode(light::ColorMode::BRIGHTNESS) && !supports_rgb && !supports_rgb_white;
-
-    const char *strip_type = is_monochromatic_ ? "monochromatic" : (supports_white_ ? "RGBW" : "RGB");
     ESP_LOGI(TAG, "Started DDP light effect '%s' for stream %u (%d LEDs, %s strip)", get_name(), stream_id_, num_leds,
-             strip_type);
+             supports_white_ ? "RGBW" : "RGB");
   } else {
     ESP_LOGI(TAG, "Started DDP light effect '%s' for stream %u (%d LEDs)", get_name(), stream_id_, num_leds);
   }
