@@ -59,7 +59,7 @@ class MediaProxyOutput : public Component {
   std::optional<int> expand_;
   std::optional<bool> loop_;
   std::optional<std::string> hw_;
-  std::optional<std::string> format_;
+  std::optional<uint8_t> format_pixcfg_;
   std::optional<std::string> fit_;
 
   friend class MediaProxyControl;
