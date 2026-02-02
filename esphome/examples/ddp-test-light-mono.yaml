@@ -1,0 +1,52 @@
+# © Copyright 2026 Stuart Parmenter
+# SPDX-License-Identifier: MIT
+
+# Test configuration for DDP monochromatic light effect
+# Tests: ddp core component + ddp_monochromatic_light_effect renderer
+#
+# Use case: Ambient lighting that syncs with video content
+# The effect aggregates all DDP pixels to a single brightness value
+
+esphome:
+  name: ddp-test-light-mono
+  friendly_name: DDP Monochromatic Light Test
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+logger:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+external_components:
+  - source: github://stuartparmenter/ddp-esphome@main
+    components: [ddp]
+    refresh: 0s
+
+# Core DDP component - handles UDP reception and protocol
+ddp:
+  id: ddp_server
+  port: 4048
+
+# PWM output for dimmable light
+output:
+  - platform: ledc
+    pin: GPIO5
+    id: dimmer_output
+
+# Monochromatic light configuration
+light:
+  - platform: monochromatic
+    id: ambient_light
+    name: "Ambient Light"
+    output: dimmer_output
+    effects:
+      - ddp_monochromatic_light_effect:
+          name: "DDP Ambient"
+          ddp_id: ddp_server
+          stream: 1
+          brightness_method: luminance  # Options: max, average, luminance

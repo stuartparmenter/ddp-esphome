@@ -3,8 +3,11 @@
 
 from esphome import codegen as cg
 import esphome.config_validation as cv
-from esphome.components.light.effects import register_addressable_effect
-from esphome.components.light.types import AddressableLightEffect
+from esphome.components.light.effects import (
+    register_addressable_effect,
+    register_monochromatic_effect,
+)
+from esphome.components.light.types import AddressableLightEffect, LightEffect
 from esphome.const import CONF_ID, CONF_NAME, CONF_PORT
 
 CODEOWNERS = ["@stuartparmenter"]
@@ -14,11 +17,21 @@ AUTO_LOAD = ["light"]
 ddp_ns = cg.esphome_ns.namespace("ddp")
 DdpComponent = ddp_ns.class_("DdpComponent", cg.Component)
 DdpLightEffect = ddp_ns.class_("DdpLightEffect", AddressableLightEffect)
+DdpMonochromaticLightEffect = ddp_ns.class_("DdpMonochromaticLightEffect", LightEffect)
+BrightnessMethod = ddp_ns.enum("BrightnessMethod")
 
 # Configuration keys
 CONF_DDP_ID = "ddp_id"
 CONF_STREAM = "stream"
 CONF_METRICS = "metrics"
+CONF_BRIGHTNESS_METHOD = "brightness_method"
+
+# Brightness method enum values
+BRIGHTNESS_METHODS = {
+    "max": BrightnessMethod.MAX,
+    "average": BrightnessMethod.AVERAGE,
+    "luminance": BrightnessMethod.LUMINANCE,
+}
 
 # Shared stream ID registry (used by ddp_canvas and ddp_light_effect)
 _used_stream_ids = set()
@@ -89,13 +102,14 @@ async def to_code(config):
     # Enable wake_loop_threadsafe for low-latency wakeup (ESPHome 2025.11+)
     try:
         from esphome.components import socket
+
         socket.require_wake_loop_threadsafe()
     except AttributeError:
         # Backward compatibility: not available in older ESPHome
         pass
 
 
-# Register ddp_light_effect as an addressable light effect
+# Register ddp_light_effect as an addressable light effect (per-pixel control)
 @register_addressable_effect(
     "ddp_light_effect",
     DdpLightEffect,
@@ -108,7 +122,7 @@ async def to_code(config):
     },
 )
 async def ddp_light_effect_to_code(config, effect_id):
-    """Register a light effect renderer"""
+    """Register an addressable light effect renderer (per-pixel DDP)"""
     parent = await cg.get_variable(config[CONF_DDP_ID])
 
     # Auto-generate stream ID if not specified (using shared registry)
@@ -121,6 +135,43 @@ async def ddp_light_effect_to_code(config, effect_id):
     effect = cg.new_Pvariable(effect_id, config[CONF_NAME])
     cg.add(effect.set_parent(parent))
     cg.add(effect.set_stream_id(stream_id))
+
+    # Register with parent DDP component
+    cg.add(parent.register_renderer(effect))
+
+    return effect
+
+
+# Register ddp_monochromatic_light_effect for mono/RGB lights (aggregated brightness)
+@register_monochromatic_effect(
+    "ddp_monochromatic_light_effect",
+    DdpMonochromaticLightEffect,
+    "DDP Mono",
+    {
+        cv.GenerateID(CONF_DDP_ID): cv.use_id(DdpComponent),
+        cv.Optional(CONF_STREAM): cv.int_range(
+            min=1, max=249
+        ),  # Optional - auto-generates if not specified
+        cv.Optional(CONF_BRIGHTNESS_METHOD, default="luminance"): cv.enum(
+            BRIGHTNESS_METHODS, lower=True
+        ),  # RGB to brightness conversion method
+    },
+)
+async def ddp_monochromatic_light_effect_to_code(config, effect_id):
+    """Register a monochromatic light effect renderer (aggregated DDP)"""
+    parent = await cg.get_variable(config[CONF_DDP_ID])
+
+    # Auto-generate stream ID if not specified (using shared registry)
+    if CONF_STREAM in config:
+        stream_id = config[CONF_STREAM]
+        register_stream_id(stream_id)
+    else:
+        stream_id = allocate_stream_id()
+
+    effect = cg.new_Pvariable(effect_id, config[CONF_NAME])
+    cg.add(effect.set_parent(parent))
+    cg.add(effect.set_stream_id(stream_id))
+    cg.add(effect.set_brightness_method(config[CONF_BRIGHTNESS_METHOD]))
 
     # Register with parent DDP component
     cg.add(parent.register_renderer(effect))

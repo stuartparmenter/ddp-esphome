@@ -22,8 +22,7 @@
 
 // DDP_METRICS is set via build flag in __init__.py if metrics: true
 
-namespace esphome {
-namespace ddp {
+namespace esphome::ddp {
 
 // DDP packet header (10 bytes)
 #pragma pack(push, 1)
@@ -149,5 +148,4 @@ class DdpComponent : public Component {
   static constexpr int64_t IDLE_TIMEOUT_US = 1'000'000;  // 1 second
 };
 
-}  // namespace ddp
-}  // namespace esphome
+}  // namespace esphome::ddp
