@@ -89,7 +89,7 @@ Many thanks to those projects for pioneering low-latency LED streaming approache
 
 - [LVGL Documentation](https://docs.lvgl.io/) - Lightweight embedded graphics library used for rendering.
 - [ESPHome](https://esphome.io/) - Framework for building firmware for ESP32/ESP8266 devices.
-- [ESP WebSocket Client](https://github.com/espressif/esp-protocols/tree/master/components/esp_websocket_client) - WebSocket client component used by `ws_ddp_control`.
+- [ESP WebSocket Client](https://github.com/espressif/esp-protocols/tree/master/components/esp_websocket_client) - WebSocket client component used by `media_proxy_control`.
 
 ## License
 
